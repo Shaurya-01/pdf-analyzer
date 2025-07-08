@@ -1,20 +1,32 @@
 import React, { useState, useCallback } from 'react';
 import './App.css';
 
+const API_BASE_URL = 'http://localhost:3000';
+
+const SUPPORTED_TYPES = ['.pdf', '.docx', '.pptx', '.png', '.jpg', '.jpeg'];
+const MAX_FILES = 10;
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
 const App = () => {
+  // === UI mode: "analysis" or "scoring" ===
+  const [mode, setMode] = useState("analysis");
+
+  // Document Analysis state
   const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [results, setResults] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState('');
 
-  const API_BASE_URL = 'http://localhost:8000';
+  // Resume Scoring state
+  const [jdText, setJdText] = useState('');
+  const [jdFile, setJdFile] = useState(null);
+  const [resumeFiles, setResumeFiles] = useState([]);
+  const [scoringResult, setScoringResult] = useState(null);
+  const [scoringError, setScoringError] = useState('');
+  const [scoringUploading, setScoringUploading] = useState(false);
 
-  // Supported file types
-  const SUPPORTED_TYPES = ['.pdf', '.docx', '.pptx', '.png', '.jpg', '.jpeg'];
-  const MAX_FILES = 10;
-  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-
+  // --- Utility functions ---
   const validateFile = (file) => {
     const ext = '.' + file.name.split('.').pop().toLowerCase();
     if (!SUPPORTED_TYPES.includes(ext)) {
@@ -26,16 +38,23 @@ const App = () => {
     return null;
   };
 
+  const formatFileSize = (bytes) => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  // --- Document Analysis handlers ---
   const handleFiles = (fileList) => {
     const newFiles = Array.from(fileList);
     if (files.length + newFiles.length > MAX_FILES) {
       setError(`Maximum ${MAX_FILES} files allowed`);
       return;
     }
-
     const validFiles = [];
     const errors = [];
-
     newFiles.forEach(file => {
       const error = validateFile(file);
       if (error) {
@@ -50,13 +69,11 @@ const App = () => {
         });
       }
     });
-
     if (errors.length > 0) {
       setError(errors.join(', '));
     } else {
       setError('');
     }
-
     setFiles(prev => [...prev, ...validFiles]);
   };
 
@@ -64,19 +81,16 @@ const App = () => {
     e.preventDefault();
     e.stopPropagation();
   }, []);
-
   const handleDragIn = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(true);
   }, []);
-
   const handleDragOut = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
   }, []);
-
   const handleDrop = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -91,17 +105,8 @@ const App = () => {
     setError('');
   };
 
-  const formatFileSize = (bytes) => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
   const analyzeFiles = async () => {
     if (files.length === 0) return;
-
     setUploading(true);
     setError('');
     setResults(null);
@@ -111,7 +116,6 @@ const App = () => {
       files.forEach(({ file }) => {
         formData.append('files', file);
       });
-
       const endpoint = files.length === 1 ? '/analyze-file' : '/analyze-multiple-files';
       const response = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: 'POST',
@@ -121,12 +125,10 @@ const App = () => {
           return singleFormData;
         })() : formData,
       });
-
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Analysis failed');
       }
-
       const data = await response.json();
       setResults(data);
     } catch (err) {
@@ -136,12 +138,93 @@ const App = () => {
     }
   };
 
-  const resetApp = () => {
+  // --- Resume Scoring handlers ---
+  const handleJdFileChange = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      setJdFile(file);
+      setJdText('');
+    }
+  };
+
+  const handleResumeFilesChange = (e) => {
+    const newResumes = Array.from(e.target.files);
+    const validFiles = [];
+    const errors = [];
+    newResumes.forEach(file => {
+      const err = validateFile(file);
+      if (err) {
+        errors.push(`${file.name}: ${err}`);
+      } else {
+        validFiles.push(file);
+      }
+    });
+    if (errors.length > 0) setScoringError(errors.join(', '));
+    else setScoringError('');
+    setResumeFiles(prev => [...prev, ...validFiles]);
+  };
+
+  const removeResumeFile = (idx) => {
+    setResumeFiles(prev => prev.filter((_, i) => i !== idx));
+    setScoringError('');
+  };
+
+  // --- UI mode switching/clearing ---
+  const switchToAnalysis = () => {
+    setMode("analysis");
     setFiles([]);
+    setUploading(false);
     setResults(null);
+    setDragActive(false);
     setError('');
   };
 
+  const switchToScoring = () => {
+    setMode("scoring");
+    setJdText('');
+    setJdFile(null);
+    setResumeFiles([]);
+    setScoringResult(null);
+    setScoringError('');
+    setScoringUploading(false);
+  };
+
+  // --- Resume scoring logic ---
+  const scoreResumes = async () => {
+    if (!jdFile && !jdText) {
+      setScoringError('Please provide a job description (file or text)');
+      return;
+    }
+    if (resumeFiles.length === 0) {
+      setScoringError('Please upload at least one resume');
+      return;
+    }
+    setScoringUploading(true);
+    setScoringResult(null);
+    setScoringError('');
+    try {
+      const formData = new FormData();
+      if (jdFile) formData.append('jd_file', jdFile);
+      if (jdText && !jdFile) formData.append('jd_text', jdText);
+      resumeFiles.forEach(f => formData.append('resumes', f));
+      const response = await fetch(`${API_BASE_URL}/score-resumes`, {
+        method: 'POST',
+        body: formData
+      });
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Scoring failed');
+      }
+      const data = await response.json();
+      setScoringResult(data);
+    } catch (err) {
+      setScoringError(err.message || 'An error occurred during resume scoring');
+    } finally {
+      setScoringUploading(false);
+    }
+  };
+
+  // --- UI ---
   return (
     <div className="app-root">
       <div className="professional-bg"></div>
@@ -153,7 +236,161 @@ const App = () => {
           <p>Upload and analyze your documents securely and intelligently</p>
         </header>
 
-        {!results ? (
+        {/* Tabs for Mode Selection */}
+        <div style={{ display: "flex", gap: "1.5rem", marginBottom: 24 }}>
+          <button
+            className={mode === "analysis" ? "tab-btn active" : "tab-btn"}
+            onClick={switchToAnalysis}
+          >
+            Document Analysis
+          </button>
+          <button
+            className={mode === "scoring" ? "tab-btn active" : "tab-btn"}
+            onClick={switchToScoring}
+          >
+            Resume Scoring
+          </button>
+        </div>
+
+        {/* Resume Scoring UI */}
+        {mode === "scoring" && (
+          <div className="resume-scoring-section">
+            <h2>Resume Scoring</h2>
+            <div className="scoring-card">
+              <div className="jd-section">
+                <h3>Job Description</h3>
+                <div>
+                  <label className="browse-btn">
+                    Upload JD File
+                    <input
+                      type="file"
+                      accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
+                      onChange={handleJdFileChange}
+                      style={{ display: 'none' }}
+                    />
+                  </label>
+                  <span style={{ marginLeft: 10, color: "#555" }}>
+                    {jdFile && jdFile.name}
+                  </span>
+                  <span style={{ margin: "0 10px" }}>|</span>
+                  <label>
+                    Or paste JD text:
+                    <textarea
+                      rows={4}
+                      value={jdText}
+                      disabled={!!jdFile}
+                      onChange={e => setJdText(e.target.value)}
+                      placeholder="Paste job description here"
+                      style={{ width: "100%", marginTop: 5 }}
+                    />
+                  </label>
+                </div>
+              </div>
+              <div className="resume-upload-section" style={{ marginTop: 16 }}>
+                <h3>Resumes</h3>
+                <label className="browse-btn">
+                  Upload Resumes
+                  <input
+                    type="file"
+                    multiple
+                    accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
+                    onChange={handleResumeFilesChange}
+                    style={{ display: 'none' }}
+                  />
+                </label>
+                <div>
+                  {resumeFiles.length > 0 && (
+                    <div className="file-list">
+                      {resumeFiles.map((f, idx) => (
+                        <div key={idx} className="file-item">
+                          <span className="file-name">{f.name}</span>
+                          <span className="file-size">{formatFileSize(f.size)}</span>
+                          <button
+                            onClick={() => removeResumeFile(idx)}
+                            className="remove-btn"
+                            title="Remove file"
+                          >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                              <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" strokeWidth="2"/>
+                              <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" strokeWidth="2"/>
+                            </svg>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="action-buttons" style={{ marginTop: 24 }}>
+                <button
+                  onClick={scoreResumes}
+                  disabled={scoringUploading || (!jdFile && !jdText) || resumeFiles.length === 0}
+                  className="analyze-btn primary"
+                >
+                  {scoringUploading ? 'Scoring...' : 'Score Resumes'}
+                </button>
+                <button onClick={switchToScoring} className="clear-btn secondary">
+                  Clear
+                </button>
+              </div>
+              {scoringError && (
+                <div className="error-message" style={{ marginTop: 12 }}>
+                  {scoringError}
+                </div>
+              )}
+            </div>
+            {/* Results */}
+            {scoringResult && (
+              <div className="results-section" style={{ marginTop: 32 }}>
+                <h3>Scoring Results</h3>
+                <div className="jd-preview">
+                  <strong>Job Description Preview:</strong>
+                  <div className="jd-text">{scoringResult.job_description.length > 600 ? scoringResult.job_description.slice(0,600) + "..." : scoringResult.job_description}</div>
+                </div>
+                {scoringResult.failed_files && scoringResult.failed_files.length > 0 && (
+                  <div className="failed-files" style={{ marginTop: 12 }}>
+                    <strong>Failed Resumes:</strong>
+                    <ul>
+                      {scoringResult.failed_files.map((err, idx) => (
+                        <li key={idx}>{err}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <div className="resume-score-results">
+                  {scoringResult.results.map((res, idx) => (
+                    <div key={idx} className="result-card" style={{ marginBottom: 18 }}>
+                      <div className="result-header">
+                        <h4>{res.filename}</h4>
+                        <span className="score-badge">Score: {res.score}/100</span>
+                      </div>
+                      <div className="result-body">
+                        <div className="summary"><strong>Summary:</strong> {res.summary}</div>
+                        <div className="strengths"><strong>Strengths:</strong>
+                          <ul>
+                            {res.strengths.split('-').filter(Boolean).map((s, i) => (
+                              <li key={i}>{s.trim()}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="weaknesses"><strong>Weaknesses:</strong>
+                          <ul>
+                            {res.weaknesses.split('-').filter(Boolean).map((s, i) => (
+                              <li key={i}>{s.trim()}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Document Analysis UI */}
+        {mode === "analysis" && (
           <div className="upload-section">
             <div
               className={`drop-zone ${dragActive ? 'drag-active' : ''} ${files.length > 0 ? 'has-files' : ''}`}
@@ -186,7 +423,6 @@ const App = () => {
                 <p>PDF, DOCX, PPTX, PNG, JPG, JPEG &middot; Max 10MB each</p>
               </div>
             </div>
-
             {error && (
               <div className="error-message">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
@@ -197,7 +433,6 @@ const App = () => {
                 {error}
               </div>
             )}
-
             {files.length > 0 && (
               <div className="file-list">
                 <h3>Selected Files ({files.length}/{MAX_FILES})</h3>
@@ -219,7 +454,6 @@ const App = () => {
                     </button>
                   </div>
                 ))}
-                
                 <div className="action-buttons">
                   <button
                     onClick={analyzeFiles}
@@ -228,22 +462,24 @@ const App = () => {
                   >
                     {uploading ? 'Analyzing...' : 'Analyze'}
                   </button>
-                  <button onClick={resetApp} className="clear-btn secondary">
+                  <button onClick={switchToAnalysis} className="clear-btn secondary">
                     Clear
                   </button>
                 </div>
               </div>
             )}
           </div>
-        ) : (
+        )}
+
+        {/* Results for Document Analysis */}
+        {mode === "analysis" && results && (
           <div className="results-section">
             <div className="results-header">
               <h2>Results</h2>
-              <button onClick={resetApp} className="new-analysis-btn">
+              <button onClick={switchToAnalysis} className="new-analysis-btn">
                 New Analysis
               </button>
             </div>
-
             {results.analyses ? (
               <div className="results-summary">
                 <div className="summary-stats">
@@ -260,7 +496,6 @@ const App = () => {
                     <span className="stat-label">Failed</span>
                   </div>
                 </div>
-
                 {results.failed_files.length > 0 && (
                   <div className="failed-files">
                     <h4>Failed Files:</h4>
@@ -269,7 +504,6 @@ const App = () => {
                     ))}
                   </div>
                 )}
-
                 <div className="analysis-results">
                   {results.analyses.map((analysis, index) => (
                     <div key={index} className="result-card">
