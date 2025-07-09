@@ -469,6 +469,23 @@ html, body, #root, .app-root {
   font-weight: 700;
 }
 
+/* Scoring badge and skills */
+.score-badge {
+  background: var(--brand-medium);
+  color: var(--white);
+  border-radius: 12px;
+  padding: 0.2em 0.8em;
+  font-weight: 700;
+  margin-left: 1em;
+  font-size: 1rem;
+}
+
+.skills-matched, .skills-missing {
+  margin-top: 0.4em;
+  font-size: 0.98rem;
+  color: var(--brand-dark);
+}
+
 /* Responsive Design */
 @media (max-width: 900px) {
   .results-section, .upload-section {
