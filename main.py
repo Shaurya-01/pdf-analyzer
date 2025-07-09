@@ -177,6 +177,39 @@ def extract_json_from_response(response_text: str) -> dict:
         return json.loads(json_str)
     return json.loads(response_text)
 
+def parse_experience_years(text):
+    matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
+    years = [int(m) for m in matches]
+    return max(years) if years else None
+
+def get_experience_range(jd_text):
+    match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), None
+    return None, None
+
+def clean_bullet_points(text):
+    lines = text.splitlines()
+    cleaned = []
+    prev_line_bullet = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(("-", "*", "•")):
+            cleaned.append(stripped)
+            prev_line_bullet = True
+        elif prev_line_bullet and not stripped:
+            continue
+        else:
+            if prev_line_bullet and cleaned:
+                cleaned[-1] += " " + stripped
+            else:
+                cleaned.append(stripped)
+            prev_line_bullet = False
+    return "\n".join(cleaned)
+
 def classify_and_summarize_document(text: str, filename: str) -> dict:
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
@@ -252,41 +285,67 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
 
+    # Extract experience years from JD and resume
+    jd_min, jd_max = get_experience_range(jd_text)
+    candidate_exp = parse_experience_years(resume_text)
+
+    # Default experience score
+    exp_score = 0
+    exp_reason = ""
+    max_score = 50
+
+    if candidate_exp is not None and jd_min is not None:
+        if jd_max is not None:
+            if jd_min <= candidate_exp <= jd_max:
+                exp_score = max_score
+                exp_reason = f"Candidate's experience ({candidate_exp} years) is within the required range ({jd_min}-{jd_max} years)."
+            elif candidate_exp < jd_min:
+                exp_score = int(max_score * (candidate_exp / jd_min))
+                exp_reason = f"Candidate's experience ({candidate_exp} years) is below the required minimum ({jd_min} years)."
+            else:
+                exp_score = int(max_score * (jd_max / candidate_exp))
+                exp_reason = f"Candidate's experience ({candidate_exp} years) exceeds the maximum required ({jd_max} years)."
+        else:
+            if candidate_exp >= jd_min:
+                exp_score = max_score
+                exp_reason = f"Candidate's experience ({candidate_exp} years) meets or exceeds the minimum required ({jd_min} years)."
+            else:
+                exp_score = int(max_score * (candidate_exp / jd_min))
+                exp_reason = f"Candidate's experience ({candidate_exp} years) is below the required minimum ({jd_min} years)."
+    else:
+        exp_score = 0
+        exp_reason = "Could not determine experience from documents."
+
+    # Clean bullet points in resume text
+    cleaned_resume_text = clean_bullet_points(resume_text)
+
+    # Now, prompt LLM for skills and feedback (using cleaned resume)
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
 
-1. **Experience Match (0-50):**
-   - Score how well the candidate's experience (years, relevance, seniority) matches the job requirements.
-   - Explain your reasoning.
-
-2. **Skills Match (0-50):**
+1. **Skills Match (0-50):**
    - Score based on overlap between required and candidate skills.
    - Give full credit for exact matches, partial credit for closely related skills (e.g., Java vs. JavaScript), and explain your reasoning.
    - List skills as: exact_matches, partial_matches (with explanation), missing_skills.
 
-3. **Feedback:**
+2. **Feedback:**
    - Summarize the candidate's strengths and weaknesses for this role.
    - Suggest areas for improvement.
 
 Return your answer as valid JSON with these keys (all are required, do not omit any!):
-- "experience_score": int (0-50)
-- "experience_reason": string
 - "skills_score": int (0-50)
 - "skills_reason": string
 - "exact_matches": list of strings
 - "partial_matches": list of dicts with "skill" and "reason"
 - "missing_skills": list of strings
-- "total_score": int (0-100)
 - "strengths": string
 - "weaknesses": string
-
-If you cannot provide a value for a key, set it to 0 (for scores) or an empty string/list as appropriate.
 
 --- JOB DESCRIPTION ---
 {jd_text[:2500]}
 
 --- RESUME ---
-{resume_text[:2500]}
+{cleaned_resume_text[:2500]}
 """
     try:
         response = groq_client.chat.completions.create(
@@ -305,21 +364,17 @@ If you cannot provide a value for a key, set it to 0 (for scores) or an empty st
             max_tokens=900
         )
         response_text = response.choices[0].message.content.strip()
-        print("LLM raw response:", response_text)
         result = extract_json_from_response(response_text)
-        # Validate presence of required keys
-        required_keys = ["experience_score", "skills_score"]
-        for key in required_keys:
-            if key not in result:
-                raise Exception(f"LLM did not return required field: {key}")
+        skills_score = result.get("skills_score", 0)
+        total_score = exp_score + skills_score
         return {
-            "score": result.get("total_score", 0),
-            "experience_score": result.get("experience_score", 0),
-            "skills_score": result.get("skills_score", 0),
-            "qualification_status": "Qualified" if result.get("experience_score", 0) >= 30 and result.get("skills_score", 0) >= 30 else "Underqualified",
-            "summary": f"Experience: {result.get('experience_reason', '')} | Skills: {result.get('skills_reason', '')}",
-            "experience_match": result.get("experience_score", 0) >= 30,
-            "experience_comment": result.get("experience_reason", ""),
+            "score": total_score,
+            "experience_score": exp_score,
+            "skills_score": skills_score,
+            "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 else "Underqualified",
+            "summary": f"Experience: {exp_reason} | Skills: {result.get('skills_reason', '')}",
+            "experience_match": exp_score >= 30,
+            "experience_comment": exp_reason,
             "skills_matched": ", ".join(result.get("exact_matches", [])),
             "skills_partial": ", ".join([f"{pm['skill']} ({pm['reason']})" for pm in result.get("partial_matches", [])]),
             "skills_missing": ", ".join(result.get("missing_skills", [])),
