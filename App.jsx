@@ -8,7 +8,6 @@ const MAX_FILES = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
 const App = () => {
-  // === UI mode: "analysis" or "scoring" ===
   const [mode, setMode] = useState("analysis");
 
   // Document Analysis state
@@ -224,7 +223,6 @@ const App = () => {
     }
   };
 
-  // --- UI ---
   return (
     <div className="app-root">
       <div className="professional-bg"></div>
@@ -236,7 +234,6 @@ const App = () => {
           <p>Upload and analyze your documents securely and intelligently</p>
         </header>
 
-        {/* Tabs for Mode Selection */}
         <div style={{ display: "flex", gap: "1.5rem", marginBottom: 24 }}>
           <button
             className={mode === "analysis" ? "tab-btn active" : "tab-btn"}
@@ -339,7 +336,6 @@ const App = () => {
                 </div>
               )}
             </div>
-            {/* Results */}
             {scoringResult && (
               <div className="results-section" style={{ marginTop: 32 }}>
                 <h3>Scoring Results</h3>
@@ -363,6 +359,9 @@ const App = () => {
                       <div className="result-header">
                         <h4>{res.filename}</h4>
                         <span className="score-badge">Score: {res.score}/100</span>
+                        <span className={res.qualification_status === "Qualified" ? "confidence high" : "confidence low"}>
+                          {res.qualification_status}
+                        </span>
                       </div>
                       <div className="result-body">
                         <div className="summary"><strong>Summary:</strong> {res.summary}</div>
@@ -380,6 +379,8 @@ const App = () => {
                             ))}
                           </ul>
                         </div>
+                        <div className="skills-matched"><strong>Skills Matched:</strong> {res.skills_matched || "None"}</div>
+                        <div className="skills-missing"><strong>Skills Missing:</strong> {res.skills_missing || "None"}</div>
                       </div>
                     </div>
                   ))}
