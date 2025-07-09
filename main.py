@@ -289,7 +289,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     jd_min, jd_max = get_experience_range(jd_text)
     candidate_exp = parse_experience_years(resume_text)
 
-    # Default experience score
+    # Strict experience scoring logic
     exp_score = 0
     exp_reason = ""
     max_score = 50
@@ -299,18 +299,15 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
             if jd_min <= candidate_exp <= jd_max:
                 exp_score = max_score
                 exp_reason = f"Candidate's experience ({candidate_exp} years) is within the required range ({jd_min}-{jd_max} years)."
-            elif candidate_exp < jd_min:
-                exp_score = int(max_score * (candidate_exp / jd_min))
-                exp_reason = f"Candidate's experience ({candidate_exp} years) is below the required minimum ({jd_min} years)."
             else:
-                exp_score = int(max_score * (jd_max / candidate_exp))
-                exp_reason = f"Candidate's experience ({candidate_exp} years) exceeds the maximum required ({jd_max} years)."
+                exp_score = 0
+                exp_reason = f"Candidate's experience ({candidate_exp} years) is outside the required range ({jd_min}-{jd_max} years)."
         else:
             if candidate_exp >= jd_min:
                 exp_score = max_score
                 exp_reason = f"Candidate's experience ({candidate_exp} years) meets or exceeds the minimum required ({jd_min} years)."
             else:
-                exp_score = int(max_score * (candidate_exp / jd_min))
+                exp_score = 0
                 exp_reason = f"Candidate's experience ({candidate_exp} years) is below the required minimum ({jd_min} years)."
     else:
         exp_score = 0
@@ -400,81 +397,86 @@ def score_resumes():
     jd_text_extracted = ""
     temp_jd_path = None
 
-    if jd_file:
-        valid, err = validate_file(jd_file)
-        if not valid:
-            return jsonify({"detail": f"JD file error: {err}"}), 400
-        filename = secure_filename(jd_file.filename)
-        ext = os.path.splitext(filename)[1].lower()
-        if ext not in SUPPORTED_EXTENSIONS:
-            return jsonify({"detail": f"Unsupported JD file type: {ext}"}), 400
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-            jd_file.save(temp_file.name)
-            temp_jd_path = temp_file.name
-        jd_text_extracted = extract_text_from_file(temp_jd_path, ext)
+    try:
+        if jd_file:
+            valid, err = validate_file(jd_file)
+            if not valid:
+                return jsonify({"detail": f"JD file error: {err}"}), 400
+            filename = secure_filename(jd_file.filename)
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                return jsonify({"detail": f"Unsupported JD file type: {ext}"}), 400
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                jd_file.save(temp_file.name)
+                temp_jd_path = temp_file.name
+            jd_text_extracted = extract_text_from_file(temp_jd_path, ext)
+        else:
+            jd_text_extracted = jd_text
+
+        if not jd_text_extracted or len(jd_text_extracted) < 10:
+            return jsonify({"detail": "No usable text in job description"}), 400
+
+        results = []
+        failed_files = []
+
+        for resume in resumes:
+            if not resume.filename:
+                failed_files.append("Unknown filename - No filename provided")
+                continue
+            valid, err = validate_file(resume)
+            if not valid:
+                failed_files.append(f"{resume.filename} - {err}")
+                continue
+            filename = secure_filename(resume.filename)
+            ext = os.path.splitext(filename)[1].lower()
+            temp_resume_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                    resume.save(temp_file.name)
+                    temp_resume_path = temp_file.name
+                resume_text = extract_text_from_file(temp_resume_path, ext)
+                if not resume_text or len(resume_text.strip()) < 10:
+                    failed_files.append(f"{resume.filename} - No readable text extracted")
+                    continue
+                result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
+                results.append({
+                    "filename": resume.filename,
+                    "score": result["score"],
+                    "experience_score": result["experience_score"],
+                    "skills_score": result["skills_score"],
+                    "qualification_status": result["qualification_status"],
+                    "summary": result["summary"],
+                    "experience_match": result["experience_match"],
+                    "experience_comment": result["experience_comment"],
+                    "skills_matched": result["skills_matched"],
+                    "skills_partial": result["skills_partial"],
+                    "skills_missing": result["skills_missing"],
+                    "strengths": result["strengths"],
+                    "weaknesses": result["weaknesses"]
+                })
+            except Exception as e:
+                failed_files.append(f"{resume.filename} - Error: {str(e)}")
+            finally:
+                if temp_resume_path and os.path.exists(temp_resume_path):
+                    try:
+                        os.unlink(temp_resume_path)
+                    except Exception:
+                        pass
+
+        return jsonify({
+            "job_description": jd_text_extracted[:2000],
+            "results": results,
+            "failed_files": failed_files
+        })
+    finally:
+        # Always clear temp JD file and reset variable after each request
         if temp_jd_path and os.path.exists(temp_jd_path):
             try:
                 os.unlink(temp_jd_path)
             except Exception:
                 pass
-    else:
-        jd_text_extracted = jd_text
-
-    if not jd_text_extracted or len(jd_text_extracted) < 10:
-        return jsonify({"detail": "No usable text in job description"}), 400
-
-    results = []
-    failed_files = []
-
-    for resume in resumes:
-        if not resume.filename:
-            failed_files.append("Unknown filename - No filename provided")
-            continue
-        valid, err = validate_file(resume)
-        if not valid:
-            failed_files.append(f"{resume.filename} - {err}")
-            continue
-        filename = secure_filename(resume.filename)
-        ext = os.path.splitext(filename)[1].lower()
-        temp_resume_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-                resume.save(temp_file.name)
-                temp_resume_path = temp_file.name
-            resume_text = extract_text_from_file(temp_resume_path, ext)
-            if not resume_text or len(resume_text.strip()) < 10:
-                failed_files.append(f"{resume.filename} - No readable text extracted")
-                continue
-            result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
-            results.append({
-                "filename": resume.filename,
-                "score": result["score"],
-                "experience_score": result["experience_score"],
-                "skills_score": result["skills_score"],
-                "qualification_status": result["qualification_status"],
-                "summary": result["summary"],
-                "experience_match": result["experience_match"],
-                "experience_comment": result["experience_comment"],
-                "skills_matched": result["skills_matched"],
-                "skills_partial": result["skills_partial"],
-                "skills_missing": result["skills_missing"],
-                "strengths": result["strengths"],
-                "weaknesses": result["weaknesses"]
-            })
-        except Exception as e:
-            failed_files.append(f"{resume.filename} - Error: {str(e)}")
-        finally:
-            if temp_resume_path and os.path.exists(temp_resume_path):
-                try:
-                    os.unlink(temp_resume_path)
-                except Exception:
-                    pass
-
-    return jsonify({
-        "job_description": jd_text_extracted[:2000],
-        "results": results,
-        "failed_files": failed_files
-    })
+        jd_text_extracted = ""
+        temp_jd_path = None
 
 @app.route("/analyze-file", methods=["POST"])
 def analyze_single_file():
