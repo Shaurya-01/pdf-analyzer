@@ -358,12 +358,18 @@ const App = () => {
                     <div key={idx} className="result-card" style={{ marginBottom: 18 }}>
                       <div className="result-header">
                         <h4>{res.filename}</h4>
-                        <span className="score-badge">Score: {res.score}/100</span>
+                        <span className="score-badge">Total Score: {res.score}/100</span>
                         <span className={res.qualification_status === "Qualified" ? "confidence high" : "confidence low"}>
                           {res.qualification_status}
                         </span>
                       </div>
                       <div className="result-body">
+                        <div>
+                          <strong>Experience Score:</strong> {res.experience_score}/50
+                        </div>
+                        <div>
+                          <strong>Skills Score:</strong> {res.skills_score}/50
+                        </div>
                         <div className="summary"><strong>Summary:</strong> {res.summary}</div>
                         <div className="strengths"><strong>Strengths:</strong>
                           <ul>
@@ -380,6 +386,7 @@ const App = () => {
                           </ul>
                         </div>
                         <div className="skills-matched"><strong>Skills Matched:</strong> {res.skills_matched || "None"}</div>
+                        <div className="skills-partial"><strong>Partial/Related Skills:</strong> {res.skills_partial || "None"}</div>
                         <div className="skills-missing"><strong>Skills Missing:</strong> {res.skills_missing || "None"}</div>
                       </div>
                     </div>
