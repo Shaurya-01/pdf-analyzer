@@ -3,39 +3,33 @@ import tempfile
 import json
 import re
 from typing import List, Optional
+from datetime import datetime
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dotenv import load_dotenv
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
 
 import PyPDF2
 from groq import Groq
 
-# OCR and image processing
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image, ImageFilter
 import cv2
 import numpy as np
 
-# Document processing libraries
 from docx import Document
 from pptx import Presentation
+
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Document & Image Analyzer")
+app = Flask(__name__)
+CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# Initialize Groq client
 try:
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
@@ -44,36 +38,6 @@ try:
 except Exception as e:
     print(f"Error initializing Groq client: {e}")
     groq_client = None
-
-class FileAnalysis(BaseModel):
-    filename: str
-    document_type: str
-    summary: str
-    confidence: str
-    extracted_text_length: int
-
-class MultiFileAnalysis(BaseModel):
-    total_files: int
-    successful_analyses: int
-    failed_files: List[str]
-    analyses: List[FileAnalysis]
-
-class ResumeScore(BaseModel):
-    filename: str
-    score: int
-    qualification_status: str
-    summary: str
-    experience_match: bool
-    experience_comment: str
-    skills_matched: str
-    skills_missing: str
-    strengths: str
-    weaknesses: str
-
-class ResumeScoreResponse(BaseModel):
-    job_description: str
-    results: List[ResumeScore]
-    failed_files: List[str]
 
 SUPPORTED_EXTENSIONS = {
     ".pdf": "application/pdf",
@@ -84,18 +48,26 @@ SUPPORTED_EXTENSIONS = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 }
 
-def validate_file_type(file: UploadFile) -> bool:
-    if not file.filename:
-        return False
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in SUPPORTED_EXTENSIONS:
-        return False
-    expected_mime = SUPPORTED_EXTENSIONS[ext]
-    if file.content_type and file.content_type != expected_mime:
-        if ext in [".jpg", ".jpeg"] and file.content_type in ["image/jpeg", "image/jpg"]:
-            return True
-        return False
-    return True
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+def allowed_file(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in SUPPORTED_EXTENSIONS
+
+def validate_file(file_storage):
+    filename = file_storage.filename
+    if not filename:
+        return False, "No filename provided"
+    if not allowed_file(filename):
+        return False, f"Unsupported file type: {os.path.splitext(filename)[1].lower()}"
+    file_storage.seek(0, os.SEEK_END)
+    size = file_storage.tell()
+    file_storage.seek(0)
+    if size == 0:
+        return False, "File is empty"
+    if size > MAX_FILE_SIZE:
+        return False, "File size too large (max 10MB)"
+    return True, None
 
 def preprocess_image_pil(image: Image.Image) -> Image.Image:
     image = image.convert("L")
@@ -200,23 +172,67 @@ def extract_text_from_file(file_path: str, file_extension: str) -> str:
         return ""
 
 def extract_json_from_response(response_text: str) -> dict:
-    if "```json" in response_text:
-        start_idx = response_text.find("```json") + len("```json")
-        end_idx = response_text.find("```", start_idx)
-        if end_idx != -1:
-            json_str = response_text[start_idx:end_idx].strip()
+    match = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+        return json.loads(json_str)
+    return json.loads(response_text)
+
+# Experience extraction helpers
+def parse_date(text):
+    for fmt in ("%b %Y", "%B %Y", "%m/%Y", "%Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    return None
+
+def extract_periods(resume_text):
+    patterns = [
+        r'([A-Za-z]{3,9} \d{4})\s*[-to]+\s*(Present|[A-Za-z]{3,9} \d{4})',
+        r'(\d{4})\s*[-to]+\s*(Present|\d{4})',
+        r'(\d{2}/\d{4})\s*[-to]+\s*(Present|\d{2}/\d{4})'
+    ]
+    periods = []
+    for pat in patterns:
+        for m in re.findall(pat, resume_text, re.IGNORECASE):
+            start, end = m
+            start = start.replace("to", "-").replace("TO", "-").replace("To", "-").strip()
+            end = end.strip()
+            periods.append((start, end))
+    return periods
+
+def calculate_years_from_periods(periods):
+    total_months = 0
+    now = datetime.now()
+    for start, end in periods:
+        s = parse_date(start) or (parse_date("Jan "+start) if re.match(r"\d{4}$", start) else None)
+        if end.lower() == "present":
+            e = now
         else:
-            json_str = response_text
-    elif "```" in response_text:
-        start_idx = response_text.find("```") + len("```")
-        end_idx = response_text.find("```", start_idx)
-        if end_idx != -1:
-            json_str = response_text[start_idx:end_idx].strip()
-        else:
-            json_str = response_text
-    else:
-        json_str = response_text
-    return json.loads(json_str)
+            e = parse_date(end) or (parse_date("Jan "+end) if re.match(r"\d{4}$", end) else None)
+        if s and e and e > s:
+            diff = (e.year - s.year) * 12 + (e.month - s.month)
+            total_months += max(0, diff)
+    return round(total_months / 12, 2) if total_months else None
+
+def extract_resume_experience(resume_text: str) -> Optional[float]:
+    patterns = [
+        r'(\d{1,2}(?:\.\d+)?)\s*\+?\s*years? of experience',
+        r'over\s*(\d{1,2}(?:\.\d+)?)\s*years',
+        r'(\d{1,2}(?:\.\d+)?)\s*\+?\s*years? experience',
+        r'(\d{1,2}(?:\.\d+)?)\s*\+?\s*years?'
+    ]
+    for pat in patterns:
+        m = re.search(pat, resume_text, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                continue
+    periods = extract_periods(resume_text)
+    years = calculate_years_from_periods(periods)
+    return years
 
 def extract_required_experience(jd_text: str) -> tuple:
     patterns = [
@@ -234,32 +250,22 @@ def extract_required_experience(jd_text: str) -> tuple:
                 return int(m.group(1)), None
     return None, None
 
-def extract_resume_experience(resume_text: str) -> float:
-    patterns = [
-        r'(\d{1,2})\+?\s*years? of experience',
-        r'over\s*(\d{1,2})\s*years',
-        r'(\d{1,2})\+?\s*years? experience',
-        r'(\d{1,2})\+?\s*years?'
+def extract_skills(text):
+    skill_keywords = [
+        'python', 'java', 'c++', 'sql', 'excel', 'communication', 'leadership', 'project management',
+        'aws', 'azure', 'docker', 'kubernetes', 'javascript', 'react', 'node', 'django', 'flask',
+        'machine learning', 'data analysis', 'cloud', 'git', 'linux', 'powerpoint', 'word', 'rest', 'api'
     ]
-    for pat in patterns:
-        m = re.search(pat, resume_text, re.IGNORECASE)
-        if m:
-            return float(m.group(1))
-    matches = re.findall(r'(\d{4})[^-\d]{0,3}[-to]{1,3}[^-\d]{0,3}(\d{4})', resume_text)
-    if matches:
-        years = []
-        for start, end in matches:
-            try:
-                years.append(int(end) - int(start))
-            except Exception:
-                pass
-        if years:
-            return max(1, sum(years))
-    return None
+    found = set()
+    text_lower = text.lower()
+    for skill in skill_keywords:
+        if skill in text_lower:
+            found.add(skill)
+    return found
 
 def classify_and_summarize_document(text: str, filename: str) -> dict:
     if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq client not initialized. Please check your API key.")
+        abort(500, description="Groq client not initialized. Please check your API key.")
     cleaned_text = re.sub(r'\s+', ' ', text).strip()
     limited_text = cleaned_text[:3000] if len(cleaned_text) > 3000 else cleaned_text
     prompt = f"""
@@ -326,106 +332,92 @@ def classify_and_summarize_document(text: str, filename: str) -> dict:
             }
     except Exception as e:
         print(f"Groq API error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error with Groq API: {str(e)}")
+        abort(500, description=f"Error with Groq API: {str(e)}")
 
 def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str) -> dict:
     if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq client not initialized. Please check your API key.")
+        abort(500, description="Groq client not initialized. Please check your API key.")
 
     min_exp, max_exp = extract_required_experience(jd_text)
     cand_exp = extract_resume_experience(resume_text)
 
-    jd_exp_string = f"{min_exp}-{max_exp} years" if min_exp and max_exp else f"minimum {min_exp} years" if min_exp else "not specified"
-    cand_exp_string = f"{cand_exp} years" if cand_exp else "not found"
+    exp_score = 0
+    exp_reason = ""
+    exp_match = False
+    tolerance = 0.5
 
-    prompt = f"""
-You are an HR AI agent. Based on the job description and resume text, score the candidate on 2 criteria:
+    if min_exp is not None:
+        if cand_exp is None:
+            exp_score = 10
+            exp_reason = "Could not determine candidate's experience from resume."
+        elif cand_exp < min_exp - tolerance:
+            exp_score = max(0, int(50 * (cand_exp / min_exp)))
+            exp_reason = f"Candidate has {cand_exp} years, required is at least {min_exp}. Underqualified."
+        elif max_exp and cand_exp > max_exp + tolerance:
+            exp_score = max(10, int(50 * (max_exp / cand_exp)))
+            exp_reason = f"Candidate has {cand_exp} years, required is {min_exp}-{max_exp}. Overqualified."
+        else:
+            exp_score = 50
+            exp_reason = f"Candidate experience ({cand_exp} years) matches requirement ({min_exp}{'-'+str(max_exp) if max_exp else ''})."
+            exp_match = True
+    else:
+        exp_score = 40 if cand_exp else 10
+        exp_reason = "No explicit experience requirement found in JD." if cand_exp else "Could not determine candidate's experience."
 
-1. **Experience Match (0-50)**:
-   - Ideal if candidate's experience is within required range.
-   - Penalize if underqualified or overqualified.
-   - Explain clearly why marks were deducted (e.g., 3 marks off for 1 year overqualified).
+    jd_skills = extract_skills(jd_text)
+    resume_skills = extract_skills(resume_text)
+    matched_skills = jd_skills & resume_skills
+    missing_skills = jd_skills - resume_skills
+    total_skills = len(jd_skills)
+    if total_skills == 0:
+        skills_score = 40
+        skills_reason = "No explicit skills found in JD."
+    else:
+        skills_score = int(50 * (len(matched_skills) / total_skills))
+        skills_reason = f"{len(matched_skills)}/{total_skills} required skills matched."
 
-2. **Skills Match (0-50)**:
-   - Evaluate overlap of candidate's skills with JD requirements.
-   - Penalize for missing major required tools, tech, or certifications.
-   - List matched and missing skills.
-   - Explain scoring clearly (e.g., 10 marks off for missing 2 key skills).
+    total_score = exp_score + skills_score
+    qualification_status = "Qualified" if exp_score >= 30 and skills_score >= 30 else "Underqualified"
 
-Provide your answer in valid JSON format with these keys:
-- "experience_score": integer (0-50)
-- "experience_reason": string
-- "skills_score": integer (0-50)
-- "skills_reason": string
-- "skills_matched": comma-separated string
-- "skills_missing": comma-separated string
-- "total_score": integer (0-100)
+    return {
+        "score": total_score,
+        "qualification_status": qualification_status,
+        "summary": f"Experience: {exp_reason} | Skills: {skills_reason}",
+        "experience_match": exp_match,
+        "experience_comment": exp_reason,
+        "skills_matched": ", ".join(sorted(matched_skills)),
+        "skills_missing": ", ".join(sorted(missing_skills)),
+        "strengths": f"- Experience Score: {exp_score}\n- Skills Score: {skills_score}",
+        "weaknesses": skills_reason if skills_score < 30 else ""
+    }
 
-Job Description Experience Requirement: {jd_exp_string}  
-Candidate Experience: {cand_exp_string}
+# Routes
 
---- JOB DESCRIPTION ---  
-{jd_text[:2500]}
+@app.route("/score-resumes", methods=["POST"])
+def score_resumes():
+    jd_file = request.files.get("jd_file")
+    jd_text = request.form.get("jd_text", "").strip()
+    resumes = request.files.getlist("resumes")
 
---- RESUME ---  
-{resume_text[:2500]}
-"""
+    if not jd_file and not jd_text:
+        return jsonify({"detail": "No job description provided (file or text required)"}), 400
 
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert HR AI that returns only valid JSON with experience and skill evaluation."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.1,
-            max_tokens=800
-        )
-        response_text = response.choices[0].message.content.strip()
-        result = extract_json_from_response(response_text)
+    if not resumes:
+        return jsonify({"detail": "No resumes uploaded"}), 400
 
-        return {
-            "score": result.get("total_score", 0),
-            "qualification_status": "Qualified" if result.get("experience_score", 0) >= 30 else "Underqualified",
-            "summary": f"Experience: {result.get('experience_reason', '')} | Skills: {result.get('skills_reason', '')}",
-            "experience_match": result.get("experience_score", 0) >= 30,
-            "experience_comment": result.get("experience_reason", ""),
-            "skills_matched": result.get("skills_matched", ""),
-            "skills_missing": result.get("skills_missing", ""),
-            "strengths": f"- Experience Score: {result.get('experience_score', 0)}\n- Skills Score: {result.get('skills_score', 0)}",
-            "weaknesses": result.get("skills_reason", "") if result.get("skills_score", 0) < 30 else ""
-        }
-
-    except Exception as e:
-        print(f"Groq resume scoring error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error with Groq API: {str(e)}")
-
-
-@app.post("/score-resumes", response_model=ResumeScoreResponse)
-async def score_resumes(
-    jd_file: Optional[UploadFile] = File(None),
-    jd_text: Optional[str] = Form(None),
-    resumes: List[UploadFile] = File(...)
-):
     jd_text_extracted = ""
     temp_jd_path = None
+
     if jd_file:
-        ext = os.path.splitext(jd_file.filename)[1].lower()
+        valid, err = validate_file(jd_file)
+        if not valid:
+            return jsonify({"detail": f"JD file error: {err}"}), 400
+        filename = secure_filename(jd_file.filename)
+        ext = os.path.splitext(filename)[1].lower()
         if ext not in SUPPORTED_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"Unsupported JD file type: {ext}")
-        content = await jd_file.read()
-        if len(content) == 0:
-            raise HTTPException(status_code=400, detail="JD file is empty")
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="JD file too large")
+            return jsonify({"detail": f"Unsupported JD file type: {ext}"}), 400
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-            temp_file.write(content)
+            jd_file.save(temp_file.name)
             temp_jd_path = temp_file.name
         jd_text_extracted = extract_text_from_file(temp_jd_path, ext)
         if temp_jd_path and os.path.exists(temp_jd_path):
@@ -433,52 +425,47 @@ async def score_resumes(
                 os.unlink(temp_jd_path)
             except Exception:
                 pass
-    elif jd_text:
-        jd_text_extracted = jd_text.strip()
     else:
-        raise HTTPException(status_code=400, detail="No job description provided (file or text required)")
+        jd_text_extracted = jd_text
+
     if not jd_text_extracted or len(jd_text_extracted) < 10:
-        raise HTTPException(status_code=400, detail="No usable text in job description")
+        return jsonify({"detail": "No usable text in job description"}), 400
+
     results = []
     failed_files = []
+
     for resume in resumes:
         if not resume.filename:
             failed_files.append("Unknown filename - No filename provided")
             continue
-        if not validate_file_type(resume):
-            ext = os.path.splitext(resume.filename)[1].lower() if resume.filename else "unknown"
-            failed_files.append(f"{resume.filename} - Unsupported file type '{ext}'")
+        valid, err = validate_file(resume)
+        if not valid:
+            failed_files.append(f"{resume.filename} - {err}")
             continue
-        content = await resume.read()
-        if len(content) == 0:
-            failed_files.append(f"{resume.filename} - Empty file")
-            continue
-        if len(content) > 10 * 1024 * 1024:
-            failed_files.append(f"{resume.filename} - File too large (>10MB)")
-            continue
-        ext = os.path.splitext(resume.filename)[1].lower()
+        filename = secure_filename(resume.filename)
+        ext = os.path.splitext(filename)[1].lower()
         temp_resume_path = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-                temp_file.write(content)
+                resume.save(temp_file.name)
                 temp_resume_path = temp_file.name
             resume_text = extract_text_from_file(temp_resume_path, ext)
             if not resume_text or len(resume_text.strip()) < 10:
                 failed_files.append(f"{resume.filename} - No readable text extracted")
                 continue
             result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
-            results.append(ResumeScore(
-                filename=resume.filename,
-                score=result["score"],
-                qualification_status=result["qualification_status"],
-                summary=result["summary"],
-                experience_match=result["experience_match"],
-                experience_comment=result["experience_comment"],
-                skills_matched=result["skills_matched"],
-                skills_missing=result["skills_missing"],
-                strengths=result["strengths"],
-                weaknesses=result["weaknesses"]
-            ))
+            results.append({
+                "filename": resume.filename,
+                "score": result["score"],
+                "qualification_status": result["qualification_status"],
+                "summary": result["summary"],
+                "experience_match": result["experience_match"],
+                "experience_comment": result["experience_comment"],
+                "skills_matched": result["skills_matched"],
+                "skills_missing": result["skills_missing"],
+                "strengths": result["strengths"],
+                "weaknesses": result["weaknesses"]
+            })
         except Exception as e:
             failed_files.append(f"{resume.filename} - Error: {str(e)}")
         finally:
@@ -487,160 +474,137 @@ async def score_resumes(
                     os.unlink(temp_resume_path)
                 except Exception:
                     pass
-    return ResumeScoreResponse(
-        job_description=jd_text_extracted[:2000],
-        results=results,
-        failed_files=failed_files
-    )
 
-@app.post("/analyze-file", response_model=FileAnalysis)
-async def analyze_single_file(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    if not validate_file_type(file):
-        ext = os.path.splitext(file.filename)[1].lower()
-        supported_exts = ", ".join(SUPPORTED_EXTENSIONS.keys())
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type '{ext}' not supported. Supported types: {supported_exts}"
-        )
-    try:
-        content = await file.read()
-        if len(content) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File size too large. Maximum size is 10MB.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error reading uploaded file: {str(e)}")
-    ext = os.path.splitext(file.filename)[1].lower()
+    return jsonify({
+        "job_description": jd_text_extracted[:2000],
+        "results": results,
+        "failed_files": failed_files
+    })
+
+@app.route("/analyze-file", methods=["POST"])
+def analyze_single_file():
+    if "file" not in request.files:
+        return jsonify({"detail": "No file uploaded"}), 400
+    file = request.files["file"]
+    valid, err = validate_file(file)
+    if not valid:
+        return jsonify({"detail": err}), 400
+
+    filename = secure_filename(file.filename)
+    ext = os.path.splitext(filename)[1].lower()
     temp_file_path = None
+
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-            temp_file.write(content)
+            file.save(temp_file.name)
             temp_file_path = temp_file.name
         extracted_text = extract_text_from_file(temp_file_path, ext)
         if not extracted_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="No text could be extracted from the file. The file might be corrupted or contain no readable text."
-            )
+            return jsonify({"detail": "No text could be extracted from the file."}), 400
         if len(extracted_text.strip()) < 10:
-            raise HTTPException(
-                status_code=400,
-                detail="Insufficient text content in the file for analysis."
-            )
-        analysis_result = classify_and_summarize_document(extracted_text, file.filename)
-        return FileAnalysis(
-            filename=file.filename,
-            document_type=analysis_result["document_type"],
-            summary=analysis_result["summary"],
-            confidence=analysis_result["confidence"],
-            extracted_text_length=len(extracted_text)
-        )
-    except HTTPException:
-        raise
+            return jsonify({"detail": "Insufficient text content in the file for analysis."}), 400
+        analysis_result = classify_and_summarize_document(extracted_text, filename)
+        return jsonify({
+            "filename": filename,
+            "document_type": analysis_result["document_type"],
+            "summary": analysis_result["summary"],
+            "confidence": analysis_result["confidence"],
+            "extracted_text_length": len(extracted_text)
+        })
     except Exception as e:
         print(f"Unexpected error in analyze_single_file: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+        return jsonify({"detail": f"An unexpected error occurred: {str(e)}"}), 500
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)
-            except Exception as cleanup_error:
-                print(f"Error cleaning up temporary file: {cleanup_error}")
+            except Exception:
+                pass
 
-@app.post("/analyze-multiple-files", response_model=MultiFileAnalysis)
-async def analyze_multiple_files(files: List[UploadFile] = File(...)):
+@app.route("/analyze-multiple-files", methods=["POST"])
+def analyze_multiple_files():
+    files = request.files.getlist("files")
     if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
+        return jsonify({"detail": "No files uploaded"}), 400
     if len(files) > 10:
-        raise HTTPException(status_code=400, detail="Too many files. Maximum 10 files per request.")
+        return jsonify({"detail": "Too many files. Maximum 10 files per request."}), 400
+
     analyses = []
     failed_files = []
     successful_count = 0
-    for file in files:
-        try:
-            if not file.filename:
-                failed_files.append(f"Unknown filename - No filename provided")
-                continue
-            if not validate_file_type(file):
-                ext = os.path.splitext(file.filename)[1].lower() if file.filename else "unknown"
-                supported_exts = ", ".join(SUPPORTED_EXTENSIONS.keys())
-                failed_files.append(f"{file.filename} - Unsupported file type '{ext}'. Supported: {supported_exts}")
-                continue
-            content = await file.read()
-            if len(content) == 0:
-                failed_files.append(f"{file.filename} - Empty file")
-                continue
-            if len(content) > 10 * 1024 * 1024:
-                failed_files.append(f"{file.filename} - File too large (>10MB)")
-                continue
-            ext = os.path.splitext(file.filename)[1].lower()
-            temp_file_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-                    temp_file.write(content)
-                    temp_file_path = temp_file.name
-                extracted_text = extract_text_from_file(temp_file_path, ext)
-                if not extracted_text.strip():
-                    failed_files.append(f"{file.filename} - No text could be extracted")
-                    continue
-                if len(extracted_text.strip()) < 10:
-                    failed_files.append(f"{file.filename} - Insufficient text content")
-                    continue
-                analysis_result = classify_and_summarize_document(extracted_text, file.filename)
-                analyses.append(FileAnalysis(
-                    filename=file.filename,
-                    document_type=analysis_result["document_type"],
-                    summary=analysis_result["summary"],
-                    confidence=analysis_result["confidence"],
-                    extracted_text_length=len(extracted_text)
-                ))
-                successful_count += 1
-            except Exception as e:
-                failed_files.append(f"{file.filename} - Processing error: {str(e)}")
-            finally:
-                if temp_file_path and os.path.exists(temp_file_path):
-                    try:
-                        os.unlink(temp_file_path)
-                    except Exception as cleanup_error:
-                        print(f"Error cleaning up temporary file {temp_file_path}: {cleanup_error}")
-        except Exception as e:
-            failed_files.append(f"{file.filename if file.filename else 'Unknown'} - Error: {str(e)}")
-    return MultiFileAnalysis(
-        total_files=len(files),
-        successful_analyses=successful_count,
-        failed_files=failed_files,
-        analyses=analyses
-    )
 
-@app.get("/health")
-async def health_check():
+    for file in files:
+        if not file.filename:
+            failed_files.append("Unknown filename - No filename provided")
+            continue
+        valid, err = validate_file(file)
+        if not valid:
+            failed_files.append(f"{file.filename} - {err}")
+            continue
+        filename = secure_filename(file.filename)
+        ext = os.path.splitext(filename)[1].lower()
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                file.save(temp_file.name)
+                temp_file_path = temp_file.name
+            extracted_text = extract_text_from_file(temp_file_path, ext)
+            if not extracted_text.strip():
+                failed_files.append(f"{file.filename} - No text could be extracted")
+                continue
+            if len(extracted_text.strip()) < 10:
+                failed_files.append(f"{file.filename} - Insufficient text content")
+                continue
+            analysis_result = classify_and_summarize_document(extracted_text, filename)
+            analyses.append({
+                "filename": filename,
+                "document_type": analysis_result["document_type"],
+                "summary": analysis_result["summary"],
+                "confidence": analysis_result["confidence"],
+                "extracted_text_length": len(extracted_text)
+            })
+            successful_count += 1
+        except Exception as e:
+            failed_files.append(f"{file.filename} - Processing error: {str(e)}")
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+
+    return jsonify({
+        "total_files": len(files),
+        "successful_analyses": successful_count,
+        "failed_files": failed_files,
+        "analyses": analyses
+    })
+
+@app.route("/health", methods=["GET"])
+def health_check():
     groq_status = "connected" if groq_client else "not connected"
     api_key_status = "present" if os.getenv("GROQ_API_KEY") else "missing"
-    return {
+    return jsonify({
         "status": "healthy",
         "message": "Document Analyzer API is running",
         "groq_status": groq_status,
         "api_key_status": api_key_status,
         "supported_file_types": list(SUPPORTED_EXTENSIONS.keys())
-    }
+    })
 
-@app.get("/")
-async def root():
-    return {
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
         "message": "Document & Image Analyzer API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "supported_file_types": list(SUPPORTED_EXTENSIONS.keys()),
         "endpoints": {
             "analyze_single": "/analyze-file",
             "analyze_multiple": "/analyze-multiple-files",
             "score_resumes": "/score-resumes",
-            "health": "/health",
-            "docs": "/docs"
+            "health": "/health"
         }
-    }
+    })
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3000, reload=True)
+    app.run(host="0.0.0.0", port=3000, debug=True)
