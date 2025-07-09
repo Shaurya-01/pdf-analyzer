@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import './App.css';
 
 const API_BASE_URL = 'http://localhost:3000';
@@ -24,6 +24,11 @@ const App = () => {
   const [scoringResult, setScoringResult] = useState(null);
   const [scoringError, setScoringError] = useState('');
   const [scoringUploading, setScoringUploading] = useState(false);
+
+  // File input refs for resetting
+  const fileInputRef = useRef(null);
+  const jdFileInputRef = useRef(null);
+  const resumeFilesInputRef = useRef(null);
 
   // --- Utility functions ---
   const validateFile = (file) => {
@@ -102,6 +107,9 @@ const App = () => {
   const removeFile = (id) => {
     setFiles(prev => prev.filter(f => f.id !== id));
     setError('');
+    if (files.length === 1 && fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
   };
 
   const analyzeFiles = async () => {
@@ -166,6 +174,9 @@ const App = () => {
   const removeResumeFile = (idx) => {
     setResumeFiles(prev => prev.filter((_, i) => i !== idx));
     setScoringError('');
+    if (resumeFiles.length === 1 && resumeFilesInputRef.current) {
+      resumeFilesInputRef.current.value = "";
+    }
   };
 
   // --- UI mode switching/clearing ---
@@ -176,6 +187,7 @@ const App = () => {
     setResults(null);
     setDragActive(false);
     setError('');
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const switchToScoring = () => {
@@ -186,6 +198,8 @@ const App = () => {
     setScoringResult(null);
     setScoringError('');
     setScoringUploading(false);
+    if (jdFileInputRef.current) jdFileInputRef.current.value = "";
+    if (resumeFilesInputRef.current) resumeFilesInputRef.current.value = "";
   };
 
   // --- Resume scoring logic ---
@@ -264,6 +278,7 @@ const App = () => {
                       accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
                       onChange={handleJdFileChange}
                       style={{ display: 'none' }}
+                      ref={jdFileInputRef}
                     />
                   </label>
                   <span style={{ marginLeft: 10, color: "#555" }}>
@@ -293,6 +308,7 @@ const App = () => {
                     accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
                     onChange={handleResumeFilesChange}
                     style={{ display: 'none' }}
+                    ref={resumeFilesInputRef}
                   />
                 </label>
                 <div>
@@ -425,6 +441,7 @@ const App = () => {
                       accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
                       onChange={(e) => handleFiles(e.target.files)}
                       className="file-input"
+                      ref={fileInputRef}
                     />
                   </label>
                 </h3>
