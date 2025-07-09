@@ -2,7 +2,6 @@ import os
 import tempfile
 import json
 import re
-from typing import List, Optional
 from datetime import datetime
 
 from flask import Flask, request, jsonify, abort
@@ -178,91 +177,6 @@ def extract_json_from_response(response_text: str) -> dict:
         return json.loads(json_str)
     return json.loads(response_text)
 
-# Experience extraction helpers
-def parse_date(text):
-    for fmt in ("%b %Y", "%B %Y", "%m/%Y", "%Y"):
-        try:
-            return datetime.strptime(text, fmt)
-        except Exception:
-            continue
-    return None
-
-def extract_periods(resume_text):
-    patterns = [
-        r'([A-Za-z]{3,9} \d{4})\s*[-to]+\s*(Present|[A-Za-z]{3,9} \d{4})',
-        r'(\d{4})\s*[-to]+\s*(Present|\d{4})',
-        r'(\d{2}/\d{4})\s*[-to]+\s*(Present|\d{2}/\d{4})'
-    ]
-    periods = []
-    for pat in patterns:
-        for m in re.findall(pat, resume_text, re.IGNORECASE):
-            start, end = m
-            start = start.replace("to", "-").replace("TO", "-").replace("To", "-").strip()
-            end = end.strip()
-            periods.append((start, end))
-    return periods
-
-def calculate_years_from_periods(periods):
-    total_months = 0
-    now = datetime.now()
-    for start, end in periods:
-        s = parse_date(start) or (parse_date("Jan "+start) if re.match(r"\d{4}$", start) else None)
-        if end.lower() == "present":
-            e = now
-        else:
-            e = parse_date(end) or (parse_date("Jan "+end) if re.match(r"\d{4}$", end) else None)
-        if s and e and e > s:
-            diff = (e.year - s.year) * 12 + (e.month - s.month)
-            total_months += max(0, diff)
-    return round(total_months / 12, 2) if total_months else None
-
-def extract_resume_experience(resume_text: str) -> Optional[float]:
-    patterns = [
-        r'(\d{1,2}(?:\.\d+)?)\s*\+?\s*years? of experience',
-        r'over\s*(\d{1,2}(?:\.\d+)?)\s*years',
-        r'(\d{1,2}(?:\.\d+)?)\s*\+?\s*years? experience',
-        r'(\d{1,2}(?:\.\d+)?)\s*\+?\s*years?'
-    ]
-    for pat in patterns:
-        m = re.search(pat, resume_text, re.IGNORECASE)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                continue
-    periods = extract_periods(resume_text)
-    years = calculate_years_from_periods(periods)
-    return years
-
-def extract_required_experience(jd_text: str) -> tuple:
-    patterns = [
-        r'(\d{1,2})\s*[-to]{0,3}\s*(\d{1,2})\s*years',
-        r'(?:minimum|min\.?)\s*(\d{1,2})\s*years',
-        r'at\s*least\s*(\d{1,2})\s*years',
-        r'(\d{1,2})\+?\s*years'
-    ]
-    for pat in patterns:
-        m = re.search(pat, jd_text, re.IGNORECASE)
-        if m:
-            if len(m.groups()) == 2:
-                return int(m.group(1)), int(m.group(2))
-            elif len(m.groups()) == 1:
-                return int(m.group(1)), None
-    return None, None
-
-def extract_skills(text):
-    skill_keywords = [
-        'python', 'java', 'c++', 'sql', 'excel', 'communication', 'leadership', 'project management',
-        'aws', 'azure', 'docker', 'kubernetes', 'javascript', 'react', 'node', 'django', 'flask',
-        'machine learning', 'data analysis', 'cloud', 'git', 'linux', 'powerpoint', 'word', 'rest', 'api'
-    ]
-    found = set()
-    text_lower = text.lower()
-    for skill in skill_keywords:
-        if skill in text_lower:
-            found.add(skill)
-    return found
-
 def classify_and_summarize_document(text: str, filename: str) -> dict:
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
@@ -338,60 +252,83 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
 
-    min_exp, max_exp = extract_required_experience(jd_text)
-    cand_exp = extract_resume_experience(resume_text)
+    prompt = f"""
+You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
 
-    exp_score = 0
-    exp_reason = ""
-    exp_match = False
-    tolerance = 0.5
+1. **Experience Match (0-50):**
+   - Score how well the candidate's experience (years, relevance, seniority) matches the job requirements.
+   - Explain your reasoning.
 
-    if min_exp is not None:
-        if cand_exp is None:
-            exp_score = 10
-            exp_reason = "Could not determine candidate's experience from resume."
-        elif cand_exp < min_exp - tolerance:
-            exp_score = max(0, int(50 * (cand_exp / min_exp)))
-            exp_reason = f"Candidate has {cand_exp} years, required is at least {min_exp}. Underqualified."
-        elif max_exp and cand_exp > max_exp + tolerance:
-            exp_score = max(10, int(50 * (max_exp / cand_exp)))
-            exp_reason = f"Candidate has {cand_exp} years, required is {min_exp}-{max_exp}. Overqualified."
-        else:
-            exp_score = 50
-            exp_reason = f"Candidate experience ({cand_exp} years) matches requirement ({min_exp}{'-'+str(max_exp) if max_exp else ''})."
-            exp_match = True
-    else:
-        exp_score = 40 if cand_exp else 10
-        exp_reason = "No explicit experience requirement found in JD." if cand_exp else "Could not determine candidate's experience."
+2. **Skills Match (0-50):**
+   - Score based on overlap between required and candidate skills.
+   - Give full credit for exact matches, partial credit for closely related skills (e.g., Java vs. JavaScript), and explain your reasoning.
+   - List skills as: exact_matches, partial_matches (with explanation), missing_skills.
 
-    jd_skills = extract_skills(jd_text)
-    resume_skills = extract_skills(resume_text)
-    matched_skills = jd_skills & resume_skills
-    missing_skills = jd_skills - resume_skills
-    total_skills = len(jd_skills)
-    if total_skills == 0:
-        skills_score = 40
-        skills_reason = "No explicit skills found in JD."
-    else:
-        skills_score = int(50 * (len(matched_skills) / total_skills))
-        skills_reason = f"{len(matched_skills)}/{total_skills} required skills matched."
+3. **Feedback:**
+   - Summarize the candidate's strengths and weaknesses for this role.
+   - Suggest areas for improvement.
 
-    total_score = exp_score + skills_score
-    qualification_status = "Qualified" if exp_score >= 30 and skills_score >= 30 else "Underqualified"
+Return your answer as valid JSON with these keys (all are required, do not omit any!):
+- "experience_score": int (0-50)
+- "experience_reason": string
+- "skills_score": int (0-50)
+- "skills_reason": string
+- "exact_matches": list of strings
+- "partial_matches": list of dicts with "skill" and "reason"
+- "missing_skills": list of strings
+- "total_score": int (0-100)
+- "strengths": string
+- "weaknesses": string
 
-    return {
-        "score": total_score,
-        "qualification_status": qualification_status,
-        "summary": f"Experience: {exp_reason} | Skills: {skills_reason}",
-        "experience_match": exp_match,
-        "experience_comment": exp_reason,
-        "skills_matched": ", ".join(sorted(matched_skills)),
-        "skills_missing": ", ".join(sorted(missing_skills)),
-        "strengths": f"- Experience Score: {exp_score}\n- Skills Score: {skills_score}",
-        "weaknesses": skills_reason if skills_score < 30 else ""
-    }
+If you cannot provide a value for a key, set it to 0 (for scores) or an empty string/list as appropriate.
 
-# Routes
+--- JOB DESCRIPTION ---
+{jd_text[:2500]}
+
+--- RESUME ---
+{resume_text[:2500]}
+"""
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert HR AI that returns only valid JSON with detailed scoring and reasoning."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.1,
+            max_tokens=900
+        )
+        response_text = response.choices[0].message.content.strip()
+        print("LLM raw response:", response_text)
+        result = extract_json_from_response(response_text)
+        # Validate presence of required keys
+        required_keys = ["experience_score", "skills_score"]
+        for key in required_keys:
+            if key not in result:
+                raise Exception(f"LLM did not return required field: {key}")
+        return {
+            "score": result.get("total_score", 0),
+            "experience_score": result.get("experience_score", 0),
+            "skills_score": result.get("skills_score", 0),
+            "qualification_status": "Qualified" if result.get("experience_score", 0) >= 30 and result.get("skills_score", 0) >= 30 else "Underqualified",
+            "summary": f"Experience: {result.get('experience_reason', '')} | Skills: {result.get('skills_reason', '')}",
+            "experience_match": result.get("experience_score", 0) >= 30,
+            "experience_comment": result.get("experience_reason", ""),
+            "skills_matched": ", ".join(result.get("exact_matches", [])),
+            "skills_partial": ", ".join([f"{pm['skill']} ({pm['reason']})" for pm in result.get("partial_matches", [])]),
+            "skills_missing": ", ".join(result.get("missing_skills", [])),
+            "strengths": result.get("strengths", ""),
+            "weaknesses": result.get("weaknesses", "")
+        }
+    except Exception as e:
+        print(f"Groq LLM scoring error: {e}")
+        abort(500, description=f"Error with Groq API or LLM response: {str(e)}")
 
 @app.route("/score-resumes", methods=["POST"])
 def score_resumes():
@@ -457,11 +394,14 @@ def score_resumes():
             results.append({
                 "filename": resume.filename,
                 "score": result["score"],
+                "experience_score": result["experience_score"],
+                "skills_score": result["skills_score"],
                 "qualification_status": result["qualification_status"],
                 "summary": result["summary"],
                 "experience_match": result["experience_match"],
                 "experience_comment": result["experience_comment"],
                 "skills_matched": result["skills_matched"],
+                "skills_partial": result["skills_partial"],
                 "skills_missing": result["skills_missing"],
                 "strengths": result["strengths"],
                 "weaknesses": result["weaknesses"]
@@ -596,7 +536,7 @@ def health_check():
 def root():
     return jsonify({
         "message": "Document & Image Analyzer API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "supported_file_types": list(SUPPORTED_EXTENSIONS.keys()),
         "endpoints": {
             "analyze_single": "/analyze-file",
