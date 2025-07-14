@@ -381,10 +381,13 @@ const App = () => {
                       </div>
                       <div className="result-body">
                         <div>
-                          <strong>Experience Score:</strong> {res.experience_score}/50
+                          <strong>Experience Score:</strong> {res.experience_score !== undefined ? `${res.experience_score}/50` : "N/A"}
                         </div>
                         <div>
-                          <strong>Skills Score:</strong> {res.skills_score}/50
+                          <strong>Skills Score:</strong> {res.skills_score !== undefined ? `${res.skills_score}/50` : "N/A"}
+                        </div>
+                        <div>
+                          <strong>Education Score:</strong> {res.education_score !== undefined ? `${res.education_score}/50` : "N/A"}
                         </div>
                         <div className="summary"><strong>Summary:</strong> {res.summary}</div>
                         <div className="strengths"><strong>Strengths:</strong>
