@@ -332,7 +332,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # --- Education scoring (updated logic) ---
+    # --- Education scoring (give full marks if any match) ---
     edu_score = 0
     edu_reason = ""
     max_edu_score = 20
@@ -344,7 +344,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         required_levels = [level for level, label in jd_edu_levels]
         required_labels = [label for level, label in jd_edu_levels]
         if candidate_edu_level in required_levels:
-            edu_score = max_edu_score
+            edu_score = max_edu_score  # Always full marks if any match
             edu_reason = (
                 f"Candidate's education ({candidate_edu_label}) matches one of the required levels ({'/'.join(required_labels)})."
             )
