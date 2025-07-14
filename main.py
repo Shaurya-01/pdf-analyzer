@@ -176,42 +176,6 @@ def extract_json_from_response(response_text: str) -> dict:
         return json.loads(json_str)
     return json.loads(response_text)
 
-# --- Improved Education Normalization ---
-EDU_MAP = [
-    (re.compile(r"\b(ph\.?d|doctorate|dr\.|dphil)\b", re.I), 4, "PhD/Doctorate"),
-    (re.compile(r"\b(masters?|m\.tech|m\.sc|m\.e\.|post[- ]?graduate)\b", re.I), 3, "Masters"),
-    (re.compile(r"\b(bachelors?|b\.tech|b\.e\.|bsc|b\.sc|b\.a\.|undergraduate|graduat(e|ion))\b", re.I), 2, "Bachelors"),
-    (re.compile(r"\b(diploma|associate|polytechnic)\b", re.I), 1, "Diploma"),
-    (re.compile(r"\b(high school|secondary|12th|10th|ssc|hsc)\b", re.I), 0, "High School"),
-]
-
-def normalize_education(text):
-    for regex, level, label in EDU_MAP:
-        if regex.search(text):
-            return level, label
-    return None, None
-
-def get_required_education_levels(jd_text):
-    found_levels = []
-    for regex, level, label in EDU_MAP:
-        if regex.search(jd_text):
-            found_levels.append((level, label))
-    return found_levels  # List of (level, label)
-
-def parse_experience_years(text):
-    matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
-    years = [int(m) for m in matches]
-    return max(years) if years else None
-
-def get_experience_range(jd_text):
-    match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), None
-    return None, None
-
 def clean_bullet_points(text):
     lines = text.splitlines()
     cleaned = []
@@ -302,6 +266,75 @@ def classify_and_summarize_document(text: str, filename: str) -> dict:
         print(f"Groq API error: {e}")
         abort(500, description=f"Error with Groq API: {str(e)}")
 
+def parse_experience_years(text):
+    matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
+    years = [int(m) for m in matches]
+    return max(years) if years else None
+
+def get_experience_range(jd_text):
+    match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), None
+    return None, None
+
+# --- New LLM-based education scoring function ---
+def llm_score_education(jd_text: str, resume_text: str, groq_client) -> dict:
+    prompt = f"""
+You are an expert HR AI. Given the following job description and candidate resume, extract and compare the education requirements and qualifications.
+
+Instructions:
+1. Extract the required education level from the job description (e.g., "Bachelor's in Computer Science", "Master's degree", "PhD", etc.).
+2. Extract the highest education level from the resume.
+3. Compare the candidate's education to the requirement.
+4. Score the education match out of 20:
+   - 20: Meets or exceeds requirement exactly.
+   - 15: Higher than required (e.g., Master's when Bachelor's required).
+   - 10: Slightly lower but relevant (e.g., Diploma when Bachelor's required).
+   - 0: No relevant education found or much lower than required.
+5. Provide a brief reason for the score.
+
+Return ONLY valid JSON with these keys:
+- "education_score": int (0-20)
+- "education_reason": string
+- "jd_education": string
+- "resume_education": string
+
+--- JOB DESCRIPTION ---
+{jd_text[:2000]}
+
+--- RESUME ---
+{resume_text[:2000]}
+"""
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert HR AI that returns only valid JSON with detailed scoring and reasoning."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+        response_text = response.choices[0].message.content.strip()
+        return extract_json_from_response(response_text)
+    except Exception as e:
+        print(f"Groq API error during education scoring: {e}")
+        return {
+            "education_score": 0,
+            "education_reason": "Error occurred during education scoring.",
+            "jd_education": "",
+            "resume_education": ""
+        }
+
 def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str) -> dict:
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
@@ -332,40 +365,12 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # --- Education scoring (give full marks if any match) ---
-    edu_score = 0
-    edu_reason = ""
-    max_edu_score = 20
+    # --- Education scoring (LLM-based) ---
+    edu_result = llm_score_education(jd_text, resume_text, groq_client)
+    edu_score = edu_result.get("education_score", 0)
+    edu_reason = edu_result.get("education_reason", "")
 
-    jd_edu_levels = get_required_education_levels(jd_text)  # Now a list
-    candidate_edu_level, candidate_edu_label = normalize_education(resume_text)
-
-    if jd_edu_levels and candidate_edu_level is not None:
-        required_levels = [level for level, label in jd_edu_levels]
-        required_labels = [label for level, label in jd_edu_levels]
-        if candidate_edu_level in required_levels:
-            edu_score = max_edu_score  # Always full marks if any match
-            edu_reason = (
-                f"Candidate's education ({candidate_edu_label}) matches one of the required levels ({'/'.join(required_labels)})."
-            )
-        elif candidate_edu_level > max(required_levels):
-            edu_score = max_edu_score - 5
-            edu_reason = (
-                f"Candidate's education ({candidate_edu_label}) is higher than required ({'/'.join(required_labels)})."
-            )
-        else:
-            edu_score = 0
-            edu_reason = (
-                f"Candidate's education ({candidate_edu_label}) is below the required level ({'/'.join(required_labels)})."
-            )
-    elif jd_edu_levels:
-        edu_score = 0
-        edu_reason = "Could not determine candidate's education or requirement."
-    else:
-        edu_score = max_edu_score // 2
-        edu_reason = "No explicit education requirement found in JD."
-
-    # LLM for skills and feedback
+    # --- Skills scoring ---
     cleaned_resume_text = clean_bullet_points(resume_text)
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
@@ -387,8 +392,6 @@ Return your answer as valid JSON with these keys (all are required, do not omit 
 - "missing_skills": list of strings
 - "strengths": string
 - "weaknesses": string
-
-If you cannot provide a value for a key, set it to 0 (for scores) or an empty string/list as appropriate.
 
 --- JOB DESCRIPTION ---
 {jd_text[:2500]}
@@ -415,6 +418,8 @@ If you cannot provide a value for a key, set it to 0 (for scores) or an empty st
         response_text = response.choices[0].message.content.strip()
         result = extract_json_from_response(response_text)
         skills_score = result.get("skills_score", 0)
+        skills_reason = result.get("skills_reason", "")
+
         total_score = exp_score + skills_score + edu_score
         return {
             "score": total_score,
@@ -422,7 +427,7 @@ If you cannot provide a value for a key, set it to 0 (for scores) or an empty st
             "skills_score": skills_score,
             "education_score": edu_score,
             "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 and edu_score >= 10 else "Underqualified",
-            "summary": f"Experience: {exp_reason} | Skills: {result.get('skills_reason', '')} | Education: {edu_reason}",
+            "summary": f"Experience: {exp_reason} | Skills: {skills_reason} | Education: {edu_reason}",
             "experience_match": exp_score >= 30,
             "experience_comment": exp_reason,
             "education_comment": edu_reason,
