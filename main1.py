@@ -19,12 +19,51 @@ from pptx import Presentation
 
 from dotenv import load_dotenv
 
-# Import Gemini API
+# Gemini API
 import google.generativeai as genai
 
-# Load environment variables
-load_dotenv()
+# --- Degree Normalization Map ---
+DEGREE_LEVELS = [
+    ("PhD", ["phd", "doctor of philosophy", "doctorate", "ph.d"]),
+    ("Master's", ["master", "msc", "m.sc", "mtech", "m.tech", "mba", "postgraduate", "post-graduate", "mca"]),
+    ("Bachelor's", ["bachelor", "btech", "b.tech", "b.e", "be", "b.sc", "bachelor of engineering", "undergraduate", "bachelor’s", "bca"]),
+    ("Diploma", ["diploma", "polytechnic"]),
+    ("High School", ["12th", "10+2", "high school", "senior secondary", "intermediate"])
+]
 
+def normalize_degree(text):
+    text = text.lower()
+    for level, keywords in DEGREE_LEVELS:
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", text):
+                return level
+    return None
+
+def extract_highest_degree(text):
+    found_levels = []
+    for level, keywords in DEGREE_LEVELS:
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", text.lower()):
+                found_levels.append(level)
+    # Return the highest degree found
+    if "PhD" in found_levels:
+        return "PhD"
+    if "Master's" in found_levels:
+        return "Master's"
+    if "Bachelor's" in found_levels:
+        return "Bachelor's"
+    if "Diploma" in found_levels:
+        return "Diploma"
+    if "High School" in found_levels:
+        return "High School"
+    return None
+
+def degree_level_order(level):
+    order = {"High School": 0, "Diploma": 1, "Bachelor's": 2, "Master's": 3, "PhD": 4}
+    return order.get(level, -1)
+
+# --- Gemini Setup ---
+load_dotenv()
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
 
@@ -46,7 +85,6 @@ SUPPORTED_EXTENSIONS = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 }
-
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 def allowed_file(filename):
@@ -207,23 +245,7 @@ def gemini_json_response(prompt: str) -> dict:
         except Exception as json_error:
             print(f"JSON parsing error: {json_error}")
             print(f"Response text: {response_text}")
-            doc_type = "Unknown"
-            summary = "Unable to generate summary"
-            confidence = "Low"
-            type_match = re.search(r'"?document_type"?\s*:\s*"([^"]*)"', response_text, re.IGNORECASE)
-            summary_match = re.search(r'"?summary"?\s*:\s*"([^"]*)"', response_text, re.IGNORECASE)
-            confidence_match = re.search(r'"?confidence"?\s*:\s*"([^"]*)"', response_text, re.IGNORECASE)
-            if type_match:
-                doc_type = type_match.group(1)
-            if summary_match:
-                summary = summary_match.group(1)
-            if confidence_match:
-                confidence = confidence_match.group(1)
-            return {
-                "document_type": doc_type,
-                "summary": summary,
-                "confidence": confidence
-            }
+            return {}
     except Exception as e:
         print(f"Gemini API error: {e}")
         abort(500, description=f"Error with Gemini API: {str(e)}")
@@ -251,21 +273,26 @@ Document Text:
 """
     return gemini_json_response(prompt)
 
-def parse_experience_years(text):
-    matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
-    years = [int(m) for m in matches]
-    return max(years) if years else None
-
-def get_experience_range(jd_text):
-    match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), None
-    return None, None
-
 def llm_score_education(jd_text: str, resume_text: str) -> dict:
+    # Try regex-based extraction first
+    jd_degree = extract_highest_degree(jd_text)
+    resume_degree = extract_highest_degree(resume_text)
+    if jd_degree and resume_degree:
+        if degree_level_order(resume_degree) >= degree_level_order(jd_degree):
+            return {
+                "education_score": 50,
+                "education_reason": f"Candidate's highest degree ({resume_degree}) meets or exceeds the JD requirement ({jd_degree}).",
+                "jd_education": jd_degree,
+                "resume_education": resume_degree
+            }
+        else:
+            return {
+                "education_score": 0,
+                "education_reason": f"Candidate's highest degree ({resume_degree}) is below the JD requirement ({jd_degree}).",
+                "jd_education": jd_degree,
+                "resume_education": resume_degree
+            }
+    # If regex fails, fallback to Gemini
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, extract and compare the education requirements and qualifications.
 
@@ -288,6 +315,20 @@ Return ONLY valid JSON with these keys:
 {resume_text[:2000]}
 """
     return gemini_json_response(prompt)
+
+def parse_experience_years(text):
+    matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
+    years = [int(m) for m in matches]
+    return max(years) if years else None
+
+def get_experience_range(jd_text):
+    match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), None
+    return None, None
 
 def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str) -> dict:
     # --- Experience scoring (out of 50) ---
@@ -316,7 +357,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # --- Education scoring (LLM-based, full or zero out of 50) ---
+    # --- Education scoring (improved) ---
     edu_result = llm_score_education(jd_text, resume_text)
     edu_score = edu_result.get("education_score", 0)
     edu_reason = edu_result.get("education_reason", "")
