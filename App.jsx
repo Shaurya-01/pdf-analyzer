@@ -374,9 +374,9 @@ const App = () => {
                     <div key={idx} className="result-card" style={{ marginBottom: 18 }}>
                       <div className="result-header">
                         <h4>{res.filename}</h4>
-                        <span className="score-badge">Total Score: {res.score}/100</span>
+                        <span className="score-badge">Total Score: {res.score}/150</span>
                         <span className={res.qualification_status === "Qualified" ? "confidence high" : "confidence low"}>
-                          {res.qualification_status}
+                          {res.qualification_status === "Qualified" ? "Qualified" : "Not Qualified"}
                         </span>
                       </div>
                       <div className="result-body">
