@@ -28,7 +28,6 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
 
-# Initialize Groq client
 try:
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
@@ -177,6 +176,30 @@ def extract_json_from_response(response_text: str) -> dict:
         return json.loads(json_str)
     return json.loads(response_text)
 
+# --- Improved Education Normalization ---
+EDU_MAP = [
+    (re.compile(r"\b(ph\.?d|doctorate|dr\.|dphil)\b", re.I), 4, "PhD/Doctorate"),
+    (re.compile(r"\b(masters?|m\.tech|m\.sc|m\.e\.|post[- ]?graduate)\b", re.I), 3, "Masters"),
+    (re.compile(r"\b(bachelors?|b\.tech|b\.e\.|bsc|b\.sc|b\.a\.|undergraduate|graduat(e|ion))\b", re.I), 2, "Bachelors"),
+    (re.compile(r"\b(diploma|associate|polytechnic)\b", re.I), 1, "Diploma"),
+    (re.compile(r"\b(high school|secondary|12th|10th|ssc|hsc)\b", re.I), 0, "High School"),
+]
+
+def normalize_education(text):
+    for regex, level, label in EDU_MAP:
+        if regex.search(text):
+            return level, label
+    return None, None
+
+def get_required_education(jd_text):
+    found_levels = []
+    for regex, level, label in EDU_MAP:
+        if regex.search(jd_text):
+            found_levels.append((level, label))
+    if found_levels:
+        return max(found_levels, key=lambda x: x[0])
+    return None, None
+
 def parse_experience_years(text):
     matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
     years = [int(m) for m in matches]
@@ -189,48 +212,6 @@ def get_experience_range(jd_text):
     match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
     if match:
         return int(match.group(1)), None
-    return None, None
-
-def parse_education_level(text):
-    levels = {
-        "phd": 4,
-        "doctorate": 4,
-        "postgraduate": 3,
-        "post-graduate": 3,
-        "masters": 3,
-        "master": 3,
-        "graduate": 2,
-        "bachelor": 2,
-        "undergraduate": 1,
-        "diploma": 1,
-        "high school": 0,
-        "secondary": 0
-    }
-    text_lower = text.lower()
-    for level, score in levels.items():
-        if level in text_lower:
-            return score
-    return None
-
-def get_required_education(jd_text):
-    levels = {
-        "phd": 4,
-        "doctorate": 4,
-        "postgraduate": 3,
-        "post-graduate": 3,
-        "masters": 3,
-        "master": 3,
-        "graduate": 2,
-        "bachelor": 2,
-        "undergraduate": 1,
-        "diploma": 1,
-        "high school": 0,
-        "secondary": 0
-    }
-    jd_lower = jd_text.lower()
-    for level, score in levels.items():
-        if level in jd_lower:
-            return score, level
     return None, None
 
 def clean_bullet_points(text):
@@ -327,7 +308,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
 
-    # Experience scoring
+    # --- Experience scoring ---
     jd_min, jd_max = get_experience_range(jd_text)
     candidate_exp = parse_experience_years(resume_text)
     exp_score = 0
@@ -353,24 +334,24 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # Education scoring
+    # --- Education scoring ---
     edu_score = 0
     edu_reason = ""
     max_edu_score = 20
 
     jd_edu_level, jd_edu_label = get_required_education(jd_text)
-    candidate_edu_level = parse_education_level(resume_text)
+    candidate_edu_level, candidate_edu_label = normalize_education(resume_text)
 
     if jd_edu_level is not None and candidate_edu_level is not None:
         if candidate_edu_level == jd_edu_level:
             edu_score = max_edu_score
-            edu_reason = f"Candidate's education matches the required level ({jd_edu_label})."
+            edu_reason = f"Candidate's education ({candidate_edu_label}) matches the required level ({jd_edu_label})."
         elif candidate_edu_level > jd_edu_level:
             edu_score = max_edu_score - 5
-            edu_reason = f"Candidate's education ({candidate_edu_level}) is higher than required ({jd_edu_label})."
+            edu_reason = f"Candidate's education ({candidate_edu_label}) is higher than required ({jd_edu_label})."
         else:
             edu_score = 0
-            edu_reason = f"Candidate's education ({candidate_edu_level}) is below the required level ({jd_edu_label})."
+            edu_reason = f"Candidate's education ({candidate_edu_label}) is below the required level ({jd_edu_label})."
     elif jd_edu_level is not None:
         edu_score = 0
         edu_reason = "Could not determine candidate's education or requirement."
@@ -378,10 +359,8 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         edu_score = max_edu_score // 2
         edu_reason = "No explicit education requirement found in JD."
 
-    # Clean bullet points in resume text
-    cleaned_resume_text = clean_bullet_points(resume_text)
-
     # LLM for skills and feedback
+    cleaned_resume_text = clean_bullet_points(resume_text)
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
 
@@ -402,6 +381,8 @@ Return your answer as valid JSON with these keys (all are required, do not omit 
 - "missing_skills": list of strings
 - "strengths": string
 - "weaknesses": string
+
+If you cannot provide a value for a key, set it to 0 (for scores) or an empty string/list as appropriate.
 
 --- JOB DESCRIPTION ---
 {jd_text[:2500]}
@@ -661,7 +642,7 @@ def health_check():
 def root():
     return jsonify({
         "message": "Document & Image Analyzer API",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "supported_file_types": list(SUPPORTED_EXTENSIONS.keys()),
         "endpoints": {
             "analyze_single": "/analyze-file",
