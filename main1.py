@@ -22,46 +22,6 @@ from dotenv import load_dotenv
 # Gemini API
 import google.generativeai as genai
 
-# --- Degree Normalization Map ---
-DEGREE_LEVELS = [
-    ("PhD", ["phd", "doctor of philosophy", "doctorate", "ph.d"]),
-    ("Master's", ["master", "msc", "m.sc", "mtech", "m.tech", "mba", "postgraduate", "post-graduate", "mca"]),
-    ("Bachelor's", ["bachelor", "btech", "b.tech", "b.e", "be", "b.sc", "bachelor of engineering", "undergraduate", "bachelor’s", "bca"]),
-    ("Diploma", ["diploma", "polytechnic"]),
-    ("High School", ["12th", "10+2", "high school", "senior secondary", "intermediate"])
-]
-
-def normalize_degree(text):
-    text = text.lower()
-    for level, keywords in DEGREE_LEVELS:
-        for kw in keywords:
-            if re.search(rf"\b{re.escape(kw)}\b", text):
-                return level
-    return None
-
-def extract_highest_degree(text):
-    found_levels = []
-    for level, keywords in DEGREE_LEVELS:
-        for kw in keywords:
-            if re.search(rf"\b{re.escape(kw)}\b", text.lower()):
-                found_levels.append(level)
-    # Return the highest degree found
-    if "PhD" in found_levels:
-        return "PhD"
-    if "Master's" in found_levels:
-        return "Master's"
-    if "Bachelor's" in found_levels:
-        return "Bachelor's"
-    if "Diploma" in found_levels:
-        return "Diploma"
-    if "High School" in found_levels:
-        return "High School"
-    return None
-
-def degree_level_order(level):
-    order = {"High School": 0, "Diploma": 1, "Bachelor's": 2, "Master's": 3, "PhD": 4}
-    return order.get(level, -1)
-
 # --- Gemini Setup ---
 load_dotenv()
 app = Flask(__name__)
@@ -274,32 +234,13 @@ Document Text:
     return gemini_json_response(prompt)
 
 def llm_score_education(jd_text: str, resume_text: str) -> dict:
-    # Try regex-based extraction first
-    jd_degree = extract_highest_degree(jd_text)
-    resume_degree = extract_highest_degree(resume_text)
-    if jd_degree and resume_degree:
-        if degree_level_order(resume_degree) >= degree_level_order(jd_degree):
-            return {
-                "education_score": 50,
-                "education_reason": f"Candidate's highest degree ({resume_degree}) meets or exceeds the JD requirement ({jd_degree}).",
-                "jd_education": jd_degree,
-                "resume_education": resume_degree
-            }
-        else:
-            return {
-                "education_score": 0,
-                "education_reason": f"Candidate's highest degree ({resume_degree}) is below the JD requirement ({jd_degree}).",
-                "jd_education": jd_degree,
-                "resume_education": resume_degree
-            }
-    # If regex fails, fallback to Gemini
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, extract and compare the education requirements and qualifications.
 
 Instructions:
-1. Extract the required education level from the job description (e.g., "Bachelor's in Computer Science", "Master's degree", "PhD", etc.).
+1. Extract all acceptable education levels from the job description (e.g., "Bachelor's in Computer Science", "Master's degree", "PhD", etc. If JD says "Bachelor's/Master's", treat both as acceptable).
 2. Extract the highest education level from the resume.
-3. If the candidate's education meets or exceeds the requirement, return 50 for "education_score". Otherwise, return 0.
+3. If the candidate's education meets or exceeds any of the requirements, return 50 for "education_score". Otherwise, return 0.
 4. Provide a brief reason for the score.
 
 Return ONLY valid JSON with these keys:
@@ -357,7 +298,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # --- Education scoring (improved) ---
+    # --- Education scoring (LLM only) ---
     edu_result = llm_score_education(jd_text, resume_text)
     edu_score = edu_result.get("education_score", 0)
     edu_reason = edu_result.get("education_reason", "")
