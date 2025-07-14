@@ -2,7 +2,6 @@ import os
 import tempfile
 import json
 import re
-from datetime import datetime
 
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
@@ -280,7 +279,6 @@ def get_experience_range(jd_text):
         return int(match.group(1)), None
     return None, None
 
-# --- New LLM-based education scoring function ---
 def llm_score_education(jd_text: str, resume_text: str, groq_client) -> dict:
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, extract and compare the education requirements and qualifications.
@@ -288,16 +286,11 @@ You are an expert HR AI. Given the following job description and candidate resum
 Instructions:
 1. Extract the required education level from the job description (e.g., "Bachelor's in Computer Science", "Master's degree", "PhD", etc.).
 2. Extract the highest education level from the resume.
-3. Compare the candidate's education to the requirement.
-4. Score the education match out of 20:
-   - 20: Meets or exceeds requirement exactly.
-   - 15: Higher than required (e.g., Master's when Bachelor's required).
-   - 10: Slightly lower but relevant (e.g., Diploma when Bachelor's required).
-   - 0: No relevant education found or much lower than required.
-5. Provide a brief reason for the score.
+3. If the candidate's education meets or exceeds the requirement, return 50 for "education_score". Otherwise, return 0.
+4. Provide a brief reason for the score.
 
 Return ONLY valid JSON with these keys:
-- "education_score": int (0-20)
+- "education_score": int (0 or 50)
 - "education_reason": string
 - "jd_education": string
 - "resume_education": string
@@ -339,7 +332,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
 
-    # --- Experience scoring ---
+    # --- Experience scoring (out of 50) ---
     jd_min, jd_max = get_experience_range(jd_text)
     candidate_exp = parse_experience_years(resume_text)
     exp_score = 0
@@ -365,12 +358,12 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # --- Education scoring (LLM-based) ---
+    # --- Education scoring (LLM-based, full or zero out of 50) ---
     edu_result = llm_score_education(jd_text, resume_text, groq_client)
     edu_score = edu_result.get("education_score", 0)
     edu_reason = edu_result.get("education_reason", "")
 
-    # --- Skills scoring ---
+    # --- Skills scoring (out of 50) ---
     cleaned_resume_text = clean_bullet_points(resume_text)
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
@@ -420,13 +413,13 @@ Return your answer as valid JSON with these keys (all are required, do not omit 
         skills_score = result.get("skills_score", 0)
         skills_reason = result.get("skills_reason", "")
 
-        total_score = exp_score + skills_score + edu_score
+        total_score = exp_score + skills_score + edu_score  # Out of 150
         return {
             "score": total_score,
             "experience_score": exp_score,
             "skills_score": skills_score,
             "education_score": edu_score,
-            "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 and edu_score >= 10 else "Underqualified",
+            "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 and edu_score == 50 else "Underqualified",
             "summary": f"Experience: {exp_reason} | Skills: {skills_reason} | Education: {edu_reason}",
             "experience_match": exp_score >= 30,
             "experience_comment": exp_reason,
