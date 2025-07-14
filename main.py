@@ -191,14 +191,12 @@ def normalize_education(text):
             return level, label
     return None, None
 
-def get_required_education(jd_text):
+def get_required_education_levels(jd_text):
     found_levels = []
     for regex, level, label in EDU_MAP:
         if regex.search(jd_text):
             found_levels.append((level, label))
-    if found_levels:
-        return max(found_levels, key=lambda x: x[0])
-    return None, None
+    return found_levels  # List of (level, label)
 
 def parse_experience_years(text):
     matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
@@ -334,25 +332,33 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
-    # --- Education scoring ---
+    # --- Education scoring (updated logic) ---
     edu_score = 0
     edu_reason = ""
     max_edu_score = 20
 
-    jd_edu_level, jd_edu_label = get_required_education(jd_text)
+    jd_edu_levels = get_required_education_levels(jd_text)  # Now a list
     candidate_edu_level, candidate_edu_label = normalize_education(resume_text)
 
-    if jd_edu_level is not None and candidate_edu_level is not None:
-        if candidate_edu_level == jd_edu_level:
+    if jd_edu_levels and candidate_edu_level is not None:
+        required_levels = [level for level, label in jd_edu_levels]
+        required_labels = [label for level, label in jd_edu_levels]
+        if candidate_edu_level in required_levels:
             edu_score = max_edu_score
-            edu_reason = f"Candidate's education ({candidate_edu_label}) matches the required level ({jd_edu_label})."
-        elif candidate_edu_level > jd_edu_level:
+            edu_reason = (
+                f"Candidate's education ({candidate_edu_label}) matches one of the required levels ({'/'.join(required_labels)})."
+            )
+        elif candidate_edu_level > max(required_levels):
             edu_score = max_edu_score - 5
-            edu_reason = f"Candidate's education ({candidate_edu_label}) is higher than required ({jd_edu_label})."
+            edu_reason = (
+                f"Candidate's education ({candidate_edu_label}) is higher than required ({'/'.join(required_labels)})."
+            )
         else:
             edu_score = 0
-            edu_reason = f"Candidate's education ({candidate_edu_label}) is below the required level ({jd_edu_label})."
-    elif jd_edu_level is not None:
+            edu_reason = (
+                f"Candidate's education ({candidate_edu_label}) is below the required level ({'/'.join(required_labels)})."
+            )
+    elif jd_edu_levels:
         edu_score = 0
         edu_reason = "Could not determine candidate's education or requirement."
     else:
