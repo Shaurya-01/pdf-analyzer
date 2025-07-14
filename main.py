@@ -191,6 +191,48 @@ def get_experience_range(jd_text):
         return int(match.group(1)), None
     return None, None
 
+def parse_education_level(text):
+    levels = {
+        "phd": 4,
+        "doctorate": 4,
+        "postgraduate": 3,
+        "post-graduate": 3,
+        "masters": 3,
+        "master": 3,
+        "graduate": 2,
+        "bachelor": 2,
+        "undergraduate": 1,
+        "diploma": 1,
+        "high school": 0,
+        "secondary": 0
+    }
+    text_lower = text.lower()
+    for level, score in levels.items():
+        if level in text_lower:
+            return score
+    return None
+
+def get_required_education(jd_text):
+    levels = {
+        "phd": 4,
+        "doctorate": 4,
+        "postgraduate": 3,
+        "post-graduate": 3,
+        "masters": 3,
+        "master": 3,
+        "graduate": 2,
+        "bachelor": 2,
+        "undergraduate": 1,
+        "diploma": 1,
+        "high school": 0,
+        "secondary": 0
+    }
+    jd_lower = jd_text.lower()
+    for level, score in levels.items():
+        if level in jd_lower:
+            return score, level
+    return None, None
+
 def clean_bullet_points(text):
     lines = text.splitlines()
     cleaned = []
@@ -285,26 +327,24 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
 
-    # Extract experience years from JD and resume
+    # Experience scoring
     jd_min, jd_max = get_experience_range(jd_text)
     candidate_exp = parse_experience_years(resume_text)
-
-    # Strict experience scoring logic
     exp_score = 0
     exp_reason = ""
-    max_score = 50
+    max_exp_score = 50
 
     if candidate_exp is not None and jd_min is not None:
         if jd_max is not None:
             if jd_min <= candidate_exp <= jd_max:
-                exp_score = max_score
+                exp_score = max_exp_score
                 exp_reason = f"Candidate's experience ({candidate_exp} years) is within the required range ({jd_min}-{jd_max} years)."
             else:
                 exp_score = 0
                 exp_reason = f"Candidate's experience ({candidate_exp} years) is outside the required range ({jd_min}-{jd_max} years)."
         else:
             if candidate_exp >= jd_min:
-                exp_score = max_score
+                exp_score = max_exp_score
                 exp_reason = f"Candidate's experience ({candidate_exp} years) meets or exceeds the minimum required ({jd_min} years)."
             else:
                 exp_score = 0
@@ -313,10 +353,35 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
+    # Education scoring
+    edu_score = 0
+    edu_reason = ""
+    max_edu_score = 20
+
+    jd_edu_level, jd_edu_label = get_required_education(jd_text)
+    candidate_edu_level = parse_education_level(resume_text)
+
+    if jd_edu_level is not None and candidate_edu_level is not None:
+        if candidate_edu_level == jd_edu_level:
+            edu_score = max_edu_score
+            edu_reason = f"Candidate's education matches the required level ({jd_edu_label})."
+        elif candidate_edu_level > jd_edu_level:
+            edu_score = max_edu_score - 5
+            edu_reason = f"Candidate's education ({candidate_edu_level}) is higher than required ({jd_edu_label})."
+        else:
+            edu_score = 0
+            edu_reason = f"Candidate's education ({candidate_edu_level}) is below the required level ({jd_edu_label})."
+    elif jd_edu_level is not None:
+        edu_score = 0
+        edu_reason = "Could not determine candidate's education or requirement."
+    else:
+        edu_score = max_edu_score // 2
+        edu_reason = "No explicit education requirement found in JD."
+
     # Clean bullet points in resume text
     cleaned_resume_text = clean_bullet_points(resume_text)
 
-    # Now, prompt LLM for skills and feedback (using cleaned resume)
+    # LLM for skills and feedback
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
 
@@ -363,15 +428,17 @@ Return your answer as valid JSON with these keys (all are required, do not omit 
         response_text = response.choices[0].message.content.strip()
         result = extract_json_from_response(response_text)
         skills_score = result.get("skills_score", 0)
-        total_score = exp_score + skills_score
+        total_score = exp_score + skills_score + edu_score
         return {
             "score": total_score,
             "experience_score": exp_score,
             "skills_score": skills_score,
-            "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 else "Underqualified",
-            "summary": f"Experience: {exp_reason} | Skills: {result.get('skills_reason', '')}",
+            "education_score": edu_score,
+            "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 and edu_score >= 10 else "Underqualified",
+            "summary": f"Experience: {exp_reason} | Skills: {result.get('skills_reason', '')} | Education: {edu_reason}",
             "experience_match": exp_score >= 30,
             "experience_comment": exp_reason,
+            "education_comment": edu_reason,
             "skills_matched": ", ".join(result.get("exact_matches", [])),
             "skills_partial": ", ".join([f"{pm['skill']} ({pm['reason']})" for pm in result.get("partial_matches", [])]),
             "skills_missing": ", ".join(result.get("missing_skills", [])),
@@ -444,10 +511,12 @@ def score_resumes():
                     "score": result["score"],
                     "experience_score": result["experience_score"],
                     "skills_score": result["skills_score"],
+                    "education_score": result["education_score"],
                     "qualification_status": result["qualification_status"],
                     "summary": result["summary"],
                     "experience_match": result["experience_match"],
                     "experience_comment": result["experience_comment"],
+                    "education_comment": result["education_comment"],
                     "skills_matched": result["skills_matched"],
                     "skills_partial": result["skills_partial"],
                     "skills_missing": result["skills_missing"],
@@ -469,7 +538,6 @@ def score_resumes():
             "failed_files": failed_files
         })
     finally:
-        # Always clear temp JD file and reset variable after each request
         if temp_jd_path and os.path.exists(temp_jd_path):
             try:
                 os.unlink(temp_jd_path)
@@ -593,7 +661,7 @@ def health_check():
 def root():
     return jsonify({
         "message": "Document & Image Analyzer API",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "supported_file_types": list(SUPPORTED_EXTENSIONS.keys()),
         "endpoints": {
             "analyze_single": "/analyze-file",
