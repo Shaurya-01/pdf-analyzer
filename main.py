@@ -194,129 +194,80 @@ def clean_bullet_points(text):
             prev_line_bullet = False
     return "\n".join(cleaned)
 
-def classify_and_summarize_document(text: str, filename: str) -> dict:
-    if not groq_client:
-        abort(500, description="Groq client not initialized. Please check your API key.")
-    cleaned_text = re.sub(r'\s+', ' ', text).strip()
-    limited_text = cleaned_text[:3000] if len(cleaned_text) > 3000 else cleaned_text
-    prompt = f"""
-    Analyze the following document text from file "{filename}" and provide:
-    1. Document Type: Classify this document as one of these types:
-       - Offer Letter
-       - Experience Letter
-       - Medical Certificate
-       - Leave Letter
-       - Resignation Letter
-       - Salary Certificate
-       - Presentation/Slides (for PowerPoint files)
-       - Report/Document (for Word documents)
-       - Other (specify what type)
-    2. Summary: Provide a one-line summary of the document's main content
-    3. Confidence: Rate your confidence in the classification (High/Medium/Low)
-    Please respond ONLY in valid JSON format with keys: "document_type", "summary", "confidence"
-    Document Text:
-    {limited_text}
-    """
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert document classifier. Analyze documents and provide accurate classifications and summaries in valid JSON format only."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.1,
-            max_tokens=500
-        )
-        response_text = response.choices[0].message.content.strip()
-        try:
-            result = extract_json_from_response(response_text)
-            return {
-                "document_type": result.get("document_type", "Unknown"),
-                "summary": result.get("summary", "Unable to generate summary"),
-                "confidence": result.get("confidence", "Low")
-            }
-        except Exception as json_error:
-            print(f"JSON parsing error: {json_error}")
-            print(f"Response text: {response_text}")
-            doc_type = "Unknown"
-            summary = "Unable to generate summary"
-            confidence = "Low"
-            type_match = re.search(r'"?document_type"?\s*:\s*"([^"]*)"', response_text, re.IGNORECASE)
-            summary_match = re.search(r'"?summary"?\s*:\s*"([^"]*)"', response_text, re.IGNORECASE)
-            confidence_match = re.search(r'"?confidence"?\s*:\s*"([^"]*)"', response_text, re.IGNORECASE)
-            if type_match:
-                doc_type = type_match.group(1)
-            if summary_match:
-                summary = summary_match.group(1)
-            if confidence_match:
-                confidence = confidence_match.group(1)
-            return {
-                "document_type": doc_type,
-                "summary": summary,
-                "confidence": confidence
-            }
-    except Exception as e:
-        print(f"Groq API error: {e}")
-        abort(500, description=f"Error with Groq API: {str(e)}")
+def extract_education_keywords(text):
+    education_keywords = [
+        'education', 'degree', 'bachelor', 'master', 'phd', 'diploma', 'certificate',
+        'qualification', 'academic', 'university', 'college', 'graduation', 'graduate',
+        'undergraduate', 'postgraduate', 'btech', 'mtech', 'bsc', 'msc', 'ba', 'ma',
+        'engineering', 'computer science', 'information technology', 'mba', 'bba'
+    ]
+    lines = text.split('\n')
+    education_lines = []
+    for i, line in enumerate(lines):
+        if any(keyword in line.lower() for keyword in education_keywords):
+            start = max(0, i-2)
+            end = min(len(lines), i+3)
+            education_lines.extend(lines[start:end])
+    return '\n'.join(education_lines) if education_lines else text
 
-def parse_experience_years(text):
-    matches = re.findall(r'(\d+)\s*(?:\+)?\s*(?:years?|yrs?)', text, re.IGNORECASE)
-    years = [int(m) for m in matches]
-    return max(years) if years else None
-
-def get_experience_range(jd_text):
-    match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    match = re.search(r'(?:minimum|required)\s*(\d+)\s*(?:years?|yrs?)', jd_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), None
-    return None, None
+def smart_text_slice(text, max_length, prioritize_education=True):
+    if len(text) <= max_length:
+        return text
+    if prioritize_education:
+        education_text = extract_education_keywords(text)
+        if education_text and len(education_text) <= max_length:
+            return education_text
+        elif education_text:
+            remaining_length = max_length - len(education_text)
+            if remaining_length > 100:
+                return education_text + "\n\n" + text[:remaining_length-len(education_text)-10]
+            else:
+                return education_text[:max_length]
+    return text[:max_length]
 
 def llm_score_education(jd_text: str, resume_text: str, groq_client) -> dict:
-    # Always keep JD at the top, and dynamically adjust resume text slice
-    jd_slice = jd_text[:2000]
-    max_prompt_length = 4000  # adjust if needed
-    available_for_resume = max_prompt_length - len(jd_slice)
-    resume_slice = resume_text[:available_for_resume]
-
+    jd_slice = smart_text_slice(jd_text, 2500, prioritize_education=True)
+    resume_slice = smart_text_slice(resume_text, 2500, prioritize_education=True)
     prompt = f"""
-You are an expert HR AI. Given the following job description and candidate resume, extract and compare the education requirements and qualifications.
+You are an expert HR AI specializing in education qualification assessment. Your task is to compare the education requirements in the job description with the candidate's education qualifications.
 
-Instructions:
-1. Extract the required education level from the job description (e.g., "Bachelor's in Computer Science", "Master's degree", "PhD", etc.).
-2. Extract the highest education level from the resume.
-3. If the candidate's education meets or exceeds the requirement, return 50 for "education_score". Otherwise, return 0.
-4. Provide a brief reason for the score.
+CRITICAL INSTRUCTIONS:
+1. Carefully read the ENTIRE job description section for education requirements
+2. Look for specific degree requirements (Bachelor's, Master's, PhD, etc.)
+3. Look for field-specific requirements (Computer Science, Engineering, etc.)
+4. If NO specific education requirement is mentioned in the job description, assume Bachelor's degree is minimum requirement
+5. Compare the candidate's highest education level with the job requirement
+6. Award 50 points if candidate meets or exceeds the requirement, 0 points if not
 
-Return ONLY valid JSON with these keys:
+EDUCATION LEVEL HIERARCHY (from lowest to highest):
+- Diploma/Certificate < Bachelor's < Master's < PhD
+
+SCORING RULES:
+- If JD requires Bachelor's and candidate has Bachelor's or higher: 50 points
+- If JD requires Master's and candidate has Master's or higher: 50 points
+- If JD requires PhD and candidate has PhD: 50 points
+- If candidate's education is below the requirement: 0 points
+- If JD has no specific education requirement mentioned: assume Bachelor's minimum
+
+Return ONLY valid JSON with these exact keys:
 - "education_score": int (0 or 50)
-- "education_reason": string
-- "jd_education": string
-- "resume_education": string
+- "education_reason": string (detailed explanation of scoring decision)
+- "jd_education_requirement": string (what education is required per JD)
+- "candidate_education": string (candidate's highest education level)
 
 --- JOB DESCRIPTION ---
 {jd_slice}
 
---- RESUME ---
+--- CANDIDATE RESUME ---
 {resume_slice}
 """
-    # Debug: print prompt length and key sections
-    print(f"JD chars: {len(jd_slice)}, Resume chars: {len(resume_slice)}, Total prompt: {len(prompt)}")
-
     try:
         response = groq_client.chat.completions.create(
             model="llama3-70b-8192",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an expert HR AI that returns only valid JSON with detailed scoring and reasoning."
+                    "content": "You are an expert HR AI that specializes in education qualification assessment. You must read the job description carefully and extract the exact education requirements. Be consistent in your evaluation across all candidates for the same job description."
                 },
                 {
                     "role": "user",
@@ -324,30 +275,36 @@ Return ONLY valid JSON with these keys:
                 }
             ],
             temperature=0.1,
-            max_tokens=500
+            max_tokens=600
         )
         response_text = response.choices[0].message.content.strip()
-        return extract_json_from_response(response_text)
+        result = extract_json_from_response(response_text)
+        score = result.get("education_score", 0)
+        if score not in [0, 50]:
+            score = 50 if score > 25 else 0
+        return {
+            "education_score": score,
+            "education_reason": result.get("education_reason", "Unable to determine education match"),
+            "jd_education": result.get("jd_education_requirement", "Not specified"),
+            "resume_education": result.get("candidate_education", "Not found")
+        }
     except Exception as e:
         print(f"Groq API error during education scoring: {e}")
         return {
             "education_score": 0,
-            "education_reason": "Error occurred during education scoring.",
-            "jd_education": "",
-            "resume_education": ""
+            "education_reason": f"Error occurred during education scoring: {str(e)}",
+            "jd_education": "Error in processing",
+            "resume_education": "Error in processing"
         }
 
 def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str) -> dict:
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
-
-    # --- Experience scoring (out of 50) ---
     jd_min, jd_max = get_experience_range(jd_text)
     candidate_exp = parse_experience_years(resume_text)
     exp_score = 0
     exp_reason = ""
     max_exp_score = 50
-
     if candidate_exp is not None and jd_min is not None:
         if jd_max is not None:
             if jd_min <= candidate_exp <= jd_max:
@@ -366,13 +323,9 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     else:
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
-
-    # --- Education scoring (LLM-based, full or zero out of 50) ---
     edu_result = llm_score_education(jd_text, resume_text, groq_client)
     edu_score = edu_result.get("education_score", 0)
     edu_reason = edu_result.get("education_reason", "")
-
-    # --- Skills scoring (out of 50) ---
     cleaned_resume_text = clean_bullet_points(resume_text)
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
@@ -421,14 +374,14 @@ Return your answer as valid JSON with these keys (all are required, do not omit 
         result = extract_json_from_response(response_text)
         skills_score = result.get("skills_score", 0)
         skills_reason = result.get("skills_reason", "")
-
         total_score = exp_score + skills_score + edu_score  # Out of 150
+        qualification_status = "Qualified" if (exp_score >= 30 and skills_score >= 30 and edu_score == 50) else "Underqualified"
         return {
             "score": total_score,
             "experience_score": exp_score,
             "skills_score": skills_score,
             "education_score": edu_score,
-            "qualification_status": "Qualified" if exp_score >= 30 and skills_score >= 30 and edu_score == 50 else "Underqualified",
+            "qualification_status": qualification_status,
             "summary": f"Experience: {exp_reason} | Skills: {skills_reason} | Education: {edu_reason}",
             "experience_match": exp_score >= 30,
             "experience_comment": exp_reason,
@@ -448,18 +401,13 @@ def score_resumes():
     jd_file = request.files.get("jd_file")
     jd_text = request.form.get("jd_text", "").strip()
     resumes = request.files.getlist("resumes")
-
     if not jd_file and not jd_text:
         return jsonify({"detail": "No job description provided (file or text required)"}), 400
-
     if not resumes:
         return jsonify({"detail": "No resumes uploaded"}), 400
-
     jd_text_extracted = ""
     temp_jd_path = None
-
     try:
-        # --- Extract JD text ONCE and use for all resumes ---
         if jd_file:
             valid, err = validate_file(jd_file)
             if not valid:
@@ -474,17 +422,13 @@ def score_resumes():
             jd_text_extracted = extract_text_from_file(temp_jd_path, ext)
         else:
             jd_text_extracted = jd_text
-
         if not jd_text_extracted or len(jd_text_extracted) < 10:
             return jsonify({"detail": "No usable text in job description"}), 400
-
-        # DEBUG: Log JD text for all resumes
         print("==== JD TEXT USED FOR ALL RESUMES ====")
-        print(jd_text_extracted[:1000])  # Print first 1000 chars for debugging
-
+        print(jd_text_extracted[:1000])
+        print("=" * 50)
         results = []
         failed_files = []
-
         for resume in resumes:
             if not resume.filename:
                 failed_files.append("Unknown filename - No filename provided")
@@ -504,9 +448,7 @@ def score_resumes():
                 if not resume_text or len(resume_text.strip()) < 10:
                     failed_files.append(f"{resume.filename} - No readable text extracted")
                     continue
-
                 print(f"Scoring resume: {resume.filename} | Resume text length: {len(resume_text)}")
-
                 result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
                 results.append({
                     "filename": resume.filename,
@@ -533,7 +475,6 @@ def score_resumes():
                         os.unlink(temp_resume_path)
                     except Exception:
                         pass
-
         return jsonify({
             "job_description": jd_text_extracted[:2000],
             "results": results,
@@ -545,8 +486,6 @@ def score_resumes():
                 os.unlink(temp_jd_path)
             except Exception:
                 pass
-        jd_text_extracted = ""
-        temp_jd_path = None
 
 @app.route("/analyze-file", methods=["POST"])
 def analyze_single_file():
@@ -556,11 +495,9 @@ def analyze_single_file():
     valid, err = validate_file(file)
     if not valid:
         return jsonify({"detail": err}), 400
-
     filename = secure_filename(file.filename)
     ext = os.path.splitext(filename)[1].lower()
     temp_file_path = None
-
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
             file.save(temp_file.name)
@@ -595,11 +532,9 @@ def analyze_multiple_files():
         return jsonify({"detail": "No files uploaded"}), 400
     if len(files) > 10:
         return jsonify({"detail": "Too many files. Maximum 10 files per request."}), 400
-
     analyses = []
     failed_files = []
     successful_count = 0
-
     for file in files:
         if not file.filename:
             failed_files.append("Unknown filename - No filename provided")
@@ -639,7 +574,6 @@ def analyze_multiple_files():
                     os.unlink(temp_file_path)
                 except Exception:
                     pass
-
     return jsonify({
         "total_files": len(files),
         "successful_analyses": successful_count,
