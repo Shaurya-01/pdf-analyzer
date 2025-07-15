@@ -450,6 +450,7 @@ def score_resumes():
     temp_jd_path = None
 
     try:
+        # --- Extract JD text ONCE and use for all resumes ---
         if jd_file:
             valid, err = validate_file(jd_file)
             if not valid:
@@ -468,9 +469,14 @@ def score_resumes():
         if not jd_text_extracted or len(jd_text_extracted) < 10:
             return jsonify({"detail": "No usable text in job description"}), 400
 
+        # DEBUG: Log JD text for all resumes
+        print("==== JD TEXT USED FOR ALL RESUMES ====")
+        print(jd_text_extracted[:1000])  # Print first 1000 chars for debugging
+
         results = []
         failed_files = []
 
+        # --- Use the same JD text for all resumes ---
         for resume in resumes:
             if not resume.filename:
                 failed_files.append("Unknown filename - No filename provided")
@@ -490,6 +496,11 @@ def score_resumes():
                 if not resume_text or len(resume_text.strip()) < 10:
                     failed_files.append(f"{resume.filename} - No readable text extracted")
                     continue
+
+                # DEBUG: Log resume filename and length
+                print(f"Scoring resume: {resume.filename} | Resume text length: {len(resume_text)}")
+
+                # --- Always use the same extracted JD text ---
                 result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
                 results.append({
                     "filename": resume.filename,
