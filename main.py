@@ -2,8 +2,6 @@ import os
 import tempfile
 import json
 import re
-import threading
-import time
 
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
@@ -282,8 +280,9 @@ def get_experience_range(jd_text):
     return None, None
 
 def llm_score_education(jd_text: str, resume_text: str, groq_client) -> dict:
+    # Always keep JD at the top, and dynamically adjust resume text slice
     jd_slice = jd_text[:2000]
-    max_prompt_length = 4000
+    max_prompt_length = 4000  # adjust if needed
     available_for_resume = max_prompt_length - len(jd_slice)
     resume_slice = resume_text[:available_for_resume]
 
@@ -308,6 +307,9 @@ Return ONLY valid JSON with these keys:
 --- RESUME ---
 {resume_slice}
 """
+    # Debug: print prompt length and key sections
+    print(f"JD chars: {len(jd_slice)}, Resume chars: {len(resume_slice)}, Total prompt: {len(prompt)}")
+
     try:
         response = groq_client.chat.completions.create(
             model="llama3-70b-8192",
@@ -339,6 +341,7 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
     if not groq_client:
         abort(500, description="Groq client not initialized. Please check your API key.")
 
+    # --- Experience scoring (out of 50) ---
     jd_min, jd_max = get_experience_range(jd_text)
     candidate_exp = parse_experience_years(resume_text)
     exp_score = 0
@@ -364,10 +367,12 @@ def score_resume_against_jd(jd_text: str, resume_text: str, resume_filename: str
         exp_score = 0
         exp_reason = "Could not determine experience from documents."
 
+    # --- Education scoring (LLM-based, full or zero out of 50) ---
     edu_result = llm_score_education(jd_text, resume_text, groq_client)
     edu_score = edu_result.get("education_score", 0)
     edu_reason = edu_result.get("education_reason", "")
 
+    # --- Skills scoring (out of 50) ---
     cleaned_resume_text = clean_bullet_points(resume_text)
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, perform a detailed evaluation:
@@ -438,71 +443,6 @@ Return your answer as valid JSON with these keys (all are required, do not omit 
         print(f"Groq LLM scoring error: {e}")
         abort(500, description=f"Error with Groq API or LLM response: {str(e)}")
 
-def score_resumes_parallel(jd_text_extracted, resumes):
-    results = []
-    failed_files = []
-    threads = []
-    lock = threading.Lock()
-
-    def worker(resume):
-        filename = secure_filename(resume.filename)
-        ext = os.path.splitext(filename)[1].lower()
-        temp_resume_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-                resume.save(temp_file.name)
-                temp_resume_path = temp_file.name
-            resume_text = extract_text_from_file(temp_resume_path, ext)
-            if not resume_text or len(resume_text.strip()) < 10:
-                with lock:
-                    failed_files.append(f"{resume.filename} - No readable text extracted")
-                return
-            result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
-            with lock:
-                results.append({
-                    "filename": resume.filename,
-                    "score": result["score"],
-                    "experience_score": result["experience_score"],
-                    "skills_score": result["skills_score"],
-                    "education_score": result["education_score"],
-                    "qualification_status": result["qualification_status"],
-                    "summary": result["summary"],
-                    "experience_match": result["experience_match"],
-                    "experience_comment": result["experience_comment"],
-                    "education_comment": result["education_comment"],
-                    "skills_matched": result["skills_matched"],
-                    "skills_partial": result["skills_partial"],
-                    "skills_missing": result["skills_missing"],
-                    "strengths": result["strengths"],
-                    "weaknesses": result["weaknesses"]
-                })
-        except Exception as e:
-            with lock:
-                failed_files.append(f"{resume.filename} - Error: {str(e)}")
-        finally:
-            if temp_resume_path and os.path.exists(temp_resume_path):
-                try:
-                    os.unlink(temp_resume_path)
-                except Exception:
-                    pass
-
-    for resume in resumes:
-        if not resume.filename:
-            failed_files.append("Unknown filename - No filename provided")
-            continue
-        valid, err = validate_file(resume)
-        if not valid:
-            failed_files.append(f"{resume.filename} - {err}")
-            continue
-        t = threading.Thread(target=worker, args=(resume,))
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
-
-    return results, failed_files
-
 @app.route("/score-resumes", methods=["POST"])
 def score_resumes():
     jd_file = request.files.get("jd_file")
@@ -519,6 +459,7 @@ def score_resumes():
     temp_jd_path = None
 
     try:
+        # --- Extract JD text ONCE and use for all resumes ---
         if jd_file:
             valid, err = validate_file(jd_file)
             if not valid:
@@ -537,19 +478,66 @@ def score_resumes():
         if not jd_text_extracted or len(jd_text_extracted) < 10:
             return jsonify({"detail": "No usable text in job description"}), 400
 
+        # DEBUG: Log JD text for all resumes
         print("==== JD TEXT USED FOR ALL RESUMES ====")
-        print(jd_text_extracted[:1000])
+        print(jd_text_extracted[:1000])  # Print first 1000 chars for debugging
 
-        start_time = time.time()
-        results, failed_files = score_resumes_parallel(jd_text_extracted, resumes)
-        total_time = time.time() - start_time
-        print(f"Processed {len(resumes)} resumes in {total_time:.2f} seconds.")
+        results = []
+        failed_files = []
+
+        for resume in resumes:
+            if not resume.filename:
+                failed_files.append("Unknown filename - No filename provided")
+                continue
+            valid, err = validate_file(resume)
+            if not valid:
+                failed_files.append(f"{resume.filename} - {err}")
+                continue
+            filename = secure_filename(resume.filename)
+            ext = os.path.splitext(filename)[1].lower()
+            temp_resume_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                    resume.save(temp_file.name)
+                    temp_resume_path = temp_file.name
+                resume_text = extract_text_from_file(temp_resume_path, ext)
+                if not resume_text or len(resume_text.strip()) < 10:
+                    failed_files.append(f"{resume.filename} - No readable text extracted")
+                    continue
+
+                print(f"Scoring resume: {resume.filename} | Resume text length: {len(resume_text)}")
+
+                result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
+                results.append({
+                    "filename": resume.filename,
+                    "score": result["score"],
+                    "experience_score": result["experience_score"],
+                    "skills_score": result["skills_score"],
+                    "education_score": result["education_score"],
+                    "qualification_status": result["qualification_status"],
+                    "summary": result["summary"],
+                    "experience_match": result["experience_match"],
+                    "experience_comment": result["experience_comment"],
+                    "education_comment": result["education_comment"],
+                    "skills_matched": result["skills_matched"],
+                    "skills_partial": result["skills_partial"],
+                    "skills_missing": result["skills_missing"],
+                    "strengths": result["strengths"],
+                    "weaknesses": result["weaknesses"]
+                })
+            except Exception as e:
+                failed_files.append(f"{resume.filename} - Error: {str(e)}")
+            finally:
+                if temp_resume_path and os.path.exists(temp_resume_path):
+                    try:
+                        os.unlink(temp_resume_path)
+                    except Exception:
+                        pass
 
         return jsonify({
             "job_description": jd_text_extracted[:2000],
             "results": results,
-            "failed_files": failed_files,
-            "processing_seconds": round(total_time, 2)
+            "failed_files": failed_files
         })
     finally:
         if temp_jd_path and os.path.exists(temp_jd_path):
