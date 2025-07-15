@@ -280,6 +280,12 @@ def get_experience_range(jd_text):
     return None, None
 
 def llm_score_education(jd_text: str, resume_text: str, groq_client) -> dict:
+    # Always keep JD at the top, and dynamically adjust resume text slice
+    jd_slice = jd_text[:2000]
+    max_prompt_length = 4000  # adjust if needed
+    available_for_resume = max_prompt_length - len(jd_slice)
+    resume_slice = resume_text[:available_for_resume]
+
     prompt = f"""
 You are an expert HR AI. Given the following job description and candidate resume, extract and compare the education requirements and qualifications.
 
@@ -296,11 +302,14 @@ Return ONLY valid JSON with these keys:
 - "resume_education": string
 
 --- JOB DESCRIPTION ---
-{jd_text[:2000]}
+{jd_slice}
 
 --- RESUME ---
-{resume_text[:2000]}
+{resume_slice}
 """
+    # Debug: print prompt length and key sections
+    print(f"JD chars: {len(jd_slice)}, Resume chars: {len(resume_slice)}, Total prompt: {len(prompt)}")
+
     try:
         response = groq_client.chat.completions.create(
             model="llama3-70b-8192",
@@ -476,7 +485,6 @@ def score_resumes():
         results = []
         failed_files = []
 
-        # --- Use the same JD text for all resumes ---
         for resume in resumes:
             if not resume.filename:
                 failed_files.append("Unknown filename - No filename provided")
@@ -497,10 +505,8 @@ def score_resumes():
                     failed_files.append(f"{resume.filename} - No readable text extracted")
                     continue
 
-                # DEBUG: Log resume filename and length
                 print(f"Scoring resume: {resume.filename} | Resume text length: {len(resume_text)}")
 
-                # --- Always use the same extracted JD text ---
                 result = score_resume_against_jd(jd_text_extracted, resume_text, resume.filename)
                 results.append({
                     "filename": resume.filename,
